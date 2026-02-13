@@ -3,3 +3,4 @@ pandas
 openpyxl
 pyarrow
 plotly
+python-dotenv
