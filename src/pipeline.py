@@ -45,7 +45,7 @@ SINONIMOS = {
 @dataclass(frozen=True)
 class RutasPipeline:
     """Rutas utilizadas por el pipeline."""
-    archivo_entrada: Path = Path("data/input/sales.xlsx")
+    archivo_entrada: Path = Path("data/input//peluqueria.xlsx")
     salida_kpis: Path = Path("data/processed/kpis.parquet")
     salida_limpio: Path = Path("data/processed/ventas_limpias.parquet")
 

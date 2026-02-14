@@ -4,6 +4,14 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+# ------------------------------------
+# Manera en la que muestra el dinero
+# ------------------------------------
+
+def eur(x: float) -> str:
+    s = f"{x:,.2f}"              # 63,539.00
+    s = s.replace(",", "X").replace(".", ",").replace("X", ".")  # 63.539,00
+    return f"{s} €"
 
 # ----------------------------
 # Configuración de la página
@@ -47,7 +55,7 @@ with c_f1:
 with c_f2:
     agrupacion = st.selectbox("Agrupar ingresos por", ["Día", "Semana", "Mes"], index=2)
 with c_f3:
-    top_n = st.slider("Top productos/servicios", 3, 20, 8)
+    top_n = st.slider("Top productos/servicios", 3, 20, 5)
 
 # Filtrar
 inicio = pd.to_datetime(rango[0])
@@ -67,9 +75,9 @@ ticket_medio = float(df_f["revenue"].mean()) if transacciones else 0.0
 unidades = float(df_f["cantidad"].sum())
 
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Ingresos", f"{ingresos:.2f} €")
-k2.metric("Transacciones", transacciones)
-k3.metric("Ticket medio", f"{ticket_medio:.2f} €")
+k1.metric("Ingresos", eur(ingresos))
+k2.metric("Ventas", transacciones)
+k3.metric("Ticket medio", eur(ticket_medio))
 k4.metric("Unidades", f"{unidades:.0f}")
 
 st.divider()
@@ -77,16 +85,40 @@ st.divider()
 # ----------------------------
 # Ingresos en el tiempo (genérico y útil)
 # ----------------------------
+df_temp = df_f.copy()
+df_temp["fecha"] = pd.to_datetime(df_temp["fecha"], errors="coerce")
+df_temp = df_temp.dropna(subset=["fecha"])
+
 if agrupacion == "Día":
-    df_f["periodo"] = df_f["fecha"].dt.date
+    # datetime diario limpio
+    df_temp["periodo"] = df_temp["fecha"].dt.floor("D")
+    tickformat = "%d %b"
+    dtick = None
+
 elif agrupacion == "Semana":
-    df_f["periodo"] = df_f["fecha"].dt.to_period("W").astype(str)
-else:
-    df_f["periodo"] = df_f["fecha"].dt.to_period("M").astype(str)
+    # Semana empezando en lunes (España)
+    df_temp["periodo"] = df_temp["fecha"].dt.to_period("W-MON").apply(lambda r: r.start_time)
+    tickformat = "%d %b"
+    dtick = 7 * 24 * 60 * 60 * 1000  # 7 días en ms
 
-serie = df_f.groupby("periodo", as_index=False)["revenue"].sum()
+else:  # "Mes"
+    df_temp["periodo"] = df_temp["fecha"].dt.to_period("M").dt.to_timestamp()
+    tickformat = "%Y-%m"
+    dtick = "M1"
 
-fig_linea = px.line(serie, x="periodo", y="revenue", title="Ingresos en el tiempo")
+serie = (
+    df_temp.groupby("periodo", as_index=False)["revenue"]
+    .sum()
+    .sort_values("periodo")
+    .rename(columns={"revenue": "ingresos"})
+)
+
+fig_linea = px.line(serie, x="periodo", y="ingresos", title="Ingresos en el tiempo", markers=True)
+fig_linea.update_yaxes(title_text="Ingresos (€)")
+fig_linea.update_xaxes(title_text="Periodo", tickformat=tickformat)
+if dtick is not None:
+    fig_linea.update_xaxes(dtick=dtick)
+
 st.plotly_chart(fig_linea, use_container_width=True)
 
 # ----------------------------
@@ -96,15 +128,18 @@ top = (
     df_f.groupby("producto", as_index=False)["revenue"].sum()
     .sort_values("revenue", ascending=False)
     .head(top_n)
+    .rename(columns={"revenue": "ingresos"})
 )
 
 fig_top = px.bar(
     top,
-    x="revenue",
+    x="ingresos",
     y="producto",
     orientation="h",
     title=f"Top {top_n} productos/servicios por ingresos",
 )
+fig_top.update_xaxes(title_text="Ingresos (€)")
+fig_top.update_yaxes(title_text="Producto/Servicio")
 st.plotly_chart(fig_top, use_container_width=True)
 
 st.divider()
@@ -115,7 +150,7 @@ st.divider()
 st.subheader("Insights rápidos")
 
 top_item = top.iloc[0]
-mejor_periodo = serie.sort_values("revenue", ascending=False).iloc[0]
+mejor_periodo = serie.sort_values("ingresos", ascending=False).iloc[0]
 
 # Concentración (qué % del total hace el top 3)
 top3 = (
@@ -128,8 +163,9 @@ pct_top3 = (top3 / ingresos * 100) if ingresos else 0.0
 
 col_i1, col_i2 = st.columns(2)
 with col_i1:
-    st.write(f"• Tu principal generador de ingresos es **{top_item['producto']}** con **{top_item['revenue']:.2f} €**.")
-    st.write(f"• El mejor periodo fue **{mejor_periodo['periodo']}** con **{mejor_periodo['revenue']:.2f} €**.")
+    st.write(f"• Tu principal generador de ingresos es **{top_item['producto']}** con **{top_item['ingresos']:.2f} €**.")
+    periodo_txt = pd.to_datetime(mejor_periodo["periodo"]).strftime("%Y-%m") if agrupacion == "Mes" else pd.to_datetime(mejor_periodo["periodo"]).strftime("%d %b %Y")
+    st.write(f"• El mejor periodo fue **{periodo_txt}** con **{mejor_periodo['ingresos']:.2f} €**.")
 with col_i2:
     st.write(f"• El **Top 3** concentra aproximadamente **{pct_top3:.1f}%** de los ingresos del rango seleccionado.")
     st.write("• Si quieres más utilidad: añade columna de **método de pago** o **empleado** y lo desglosamos.")
