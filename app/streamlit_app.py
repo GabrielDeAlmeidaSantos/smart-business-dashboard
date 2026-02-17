@@ -5,10 +5,15 @@ import plotly.express as px
 import streamlit as st
 
 # ------------------------------------
-# Formato de dinero (ES)
+# Utilidades
 # ------------------------------------
 def eur(x: float) -> str:
-    s = f"{float(x):,.2f}"
+    """Formato € estilo ES (63.539,00 €)."""
+    try:
+        x = float(x)
+    except Exception:
+        x = 0.0
+    s = f"{x:,.2f}"
     s = s.replace(",", "X").replace(".", ",").replace("X", ".")
     return f"{s} €"
 
@@ -20,22 +25,30 @@ def safe_date_str(dt) -> str:
         return "-"
 
 
+def pct_str(delta: float, base: float) -> str:
+    """Devuelve '+3.2%' o '-1.1%' (si base=0 => '')."""
+    if base is None or base == 0:
+        return ""
+    p = (delta / base) * 100.0
+    sign = "+" if p >= 0 else ""
+    return f"{sign}{p:.1f}%"
+
+
 def compute_kpis(df_: pd.DataFrame) -> dict:
-    """KPIs básicos sin suposiciones."""
+    """KPIs básicos."""
     if df_ is None or df_.empty:
         return {"ingresos": 0.0, "ventas": 0, "ticket": 0.0, "unidades": 0}
 
     ingresos = float(df_["revenue"].sum())
-    ventas = int(len(df_))
+    ventas = int(len(df_))  # cada fila = ticket/linea (según tu pipeline)
     ticket = float(df_["revenue"].mean()) if ventas else 0.0
-    unidades = int(df_["cantidad"].sum())
+    unidades = float(df_["cantidad"].sum())
     return {"ingresos": ingresos, "ventas": ventas, "ticket": ticket, "unidades": unidades}
 
 
 @st.cache_data(show_spinner=False)
 def load_data(path: str) -> pd.DataFrame:
-    df = pd.read_parquet(path)
-    return df
+    return pd.read_parquet(path)
 
 
 def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
@@ -51,8 +64,16 @@ def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_ingresos_por_dia(df_f: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Devuelve tabla de ingresos por día ordenada y diccionario útil (mejor/peor/gap)."""
-    mapa_dias = {0: "Lunes", 1: "Martes", 2: "Miércoles", 3: "Jueves", 4: "Viernes", 5: "Sábado", 6: "Domingo"}
+    """Ingresos por día de semana + info (mejor/peor/gap/ventas_peor)."""
+    mapa_dias = {
+        0: "Lunes",
+        1: "Martes",
+        2: "Miércoles",
+        3: "Jueves",
+        4: "Viernes",
+        5: "Sábado",
+        6: "Domingo",
+    }
 
     df_sem = df_f.copy()
     df_sem["dia_semana"] = df_sem["fecha"].dt.dayofweek
@@ -74,7 +95,11 @@ def compute_ingresos_por_dia(df_f: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         .size()
         .rename(columns={"size": "ventas"})
     )
-    ventas_peor = int(ventas_por_dia.loc[ventas_por_dia["dia_nombre"] == peor["dia_nombre"], "ventas"].iloc[0])
+    ventas_peor = int(
+        ventas_por_dia.loc[
+            ventas_por_dia["dia_nombre"] == peor["dia_nombre"], "ventas"
+        ].iloc[0]
+    )
 
     info = {
         "df_sem": df_sem,
@@ -107,6 +132,8 @@ def build_serie_tiempo(df_f: pd.DataFrame, agrupacion: str) -> pd.DataFrame:
 
 
 def fig_ingresos_tiempo(serie: pd.DataFrame, agrupacion: str):
+    serie = serie.copy()
+
     if agrupacion == "Mes":
         tickformat, dtick = "%Y-%m", "M1"
         serie["hover_fecha"] = serie["periodo"].dt.strftime("%Y-%m")
@@ -143,6 +170,7 @@ def fig_top_servicios(df_f: pd.DataFrame, top_n: int):
         .head(int(top_n))
         .rename(columns={"revenue": "ingresos"})
     )
+
     top_total = float(df_f["revenue"].sum()) if not df_f.empty else 0.0
     top["pct"] = (top["ingresos"] / top_total * 100) if top_total else 0.0
     top["hover_eur"] = top["ingresos"].apply(eur)
@@ -181,7 +209,7 @@ def fig_ingresos_dia_semana(ingresos_dia: pd.DataFrame):
 
 
 # ----------------------------
-# Configuración de la página
+# Configuración
 # ----------------------------
 st.set_page_config(page_title="Resumen del Negocio", layout="wide")
 st.title("Resumen del Negocio (ventas)")
@@ -189,11 +217,11 @@ st.title("Resumen del Negocio (ventas)")
 RUTA_DATOS = Path("data/processed/ventas_limpias.parquet")
 
 # ----------------------------
-# Sidebar (modo cliente por defecto)
+# Sidebar
 # ----------------------------
 with st.sidebar:
     st.header("Controles")
-    modo_admin = st.toggle("Modo admin", value=False, key="modo_admin_v3")
+    modo_admin = st.toggle("Modo admin", value=False, key="modo_admin_v4")
     st.caption("Filtra fechas y mira el resumen en segundos.")
     st.divider()
 
@@ -227,7 +255,7 @@ st.caption(
 )
 
 # ----------------------------
-# Controles (filtros)
+# Filtros
 # ----------------------------
 min_f, max_f = df["fecha"].min().date(), df["fecha"].max().date()
 
@@ -238,21 +266,21 @@ with c_f1:
         value=(min_f, max_f),
         min_value=min_f,
         max_value=max_f,
-        key="rango_v3",
+        key="rango_v4",
     )
 with c_f2:
     agrupacion = st.selectbox(
         "Agrupar ingresos por",
         ["Mes", "Semana", "Día"],
         index=0,
-        key="agrupacion_v3",
+        key="agrupacion_v4",
     )
 with c_f3:
     top_n = st.selectbox(
         "Top servicios",
         [5, 10, 15, 20],
         index=0,
-        key="top_n_v3",
+        key="top_n_v4",
     )
 
 if not isinstance(rango, (list, tuple)) or len(rango) != 2:
@@ -268,7 +296,7 @@ if df_f.empty:
     st.stop()
 
 # ----------------------------
-# Periodo anterior (misma duración) para comparar
+# Comparativa (misma duración, periodo anterior)
 # ----------------------------
 duracion = fin - inicio
 inicio_prev = inicio - duracion
@@ -283,14 +311,36 @@ delta_ven = kpis_act["ventas"] - kpis_prev["ventas"]
 delta_tic = kpis_act["ticket"] - kpis_prev["ticket"]
 delta_uni = kpis_act["unidades"] - kpis_prev["unidades"]
 
+# Texto de referencia de las flechas (MUY importante para no confundir)
+st.caption(
+    f"📌 Flechas verdes y rojas = comparación con el **periodo anterior** de la misma duración "
+)
+
 # ----------------------------
-# KPIs principales (con comparación)
+# KPIs principales
 # ----------------------------
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Ingresos", eur(kpis_act["ingresos"]), delta=eur(delta_ing) if kpis_prev["ingresos"] else None)
-k2.metric("Ventas (tickets)", f"{kpis_act['ventas']}", delta=f"{delta_ven}" if kpis_prev["ventas"] else None)
-k3.metric("Ticket medio", eur(kpis_act["ticket"]), delta=eur(delta_tic) if kpis_prev["ticket"] else None)
-k4.metric("Unidades", f"{kpis_act['unidades']}", delta=f"{delta_uni}" if kpis_prev["unidades"] else None)
+
+k1.metric(
+    "Ingresos",
+    eur(kpis_act["ingresos"]),
+    delta=f"{eur(delta_ing)} ({pct_str(delta_ing, kpis_prev['ingresos'])})" if kpis_prev["ingresos"] else None,
+)
+k2.metric(
+    "Ventas (tickets)",
+    f"{kpis_act['ventas']}",
+    delta=f"{delta_ven} ({pct_str(delta_ven, kpis_prev['ventas'])})" if kpis_prev["ventas"] else None,
+)
+k3.metric(
+    "Ticket medio",
+    eur(kpis_act["ticket"]),
+    delta=f"{eur(delta_tic)} ({pct_str(delta_tic, kpis_prev['ticket'])})" if kpis_prev["ticket"] else None,
+)
+k4.metric(
+    "Unidades",
+    f"{int(kpis_act['unidades'])}",
+    delta=f"{int(delta_uni)} ({pct_str(delta_uni, kpis_prev['unidades'])})" if kpis_prev["unidades"] else None,
+)
 
 st.divider()
 
@@ -304,7 +354,7 @@ gap = info_dias["gap"]
 ventas_peor = info_dias["ventas_peor"]
 
 # ----------------------------
-# Resumen ejecutivo (modo venta)
+# Resumen ejecutivo (venta)
 # ----------------------------
 st.subheader("Resumen ejecutivo")
 
@@ -323,27 +373,49 @@ st.write(
     f"**Recomendación rápida:** concentra una acción comercial el **{peor_dia['dia_nombre']}** "
     f"(upsell/pack/recordatorio). Con **{ventas_peor}** ventas ese día, pequeñas mejoras escalan rápido."
 )
+
 st.divider()
 
 # ----------------------------
-# Simulador rápido (escenario) - arriba para convertir
+# Simulador (escenario) + Impactos
 # ----------------------------
 st.subheader("Simulador rápido (escenario)")
 st.caption("Estimación basada en tu ticket medio y el volumen de ventas del día más flojo.")
 
 cS1, cS2 = st.columns([2, 1])
 with cS1:
-    subida_eur = st.slider("Subida de ticket medio en el día flojo (€)", 0, 10, 3, key="subida_ticket_v3")
+    subida_eur = st.slider(
+        "Subida de ticket medio en el día flojo (€)",
+        min_value=0,
+        max_value=10,
+        value=3,
+        step=1,
+        key="subida_ticket_v4",
+    )
 with cS2:
-    horizonte = st.selectbox("Horizonte", ["Mes", "Trimestre"], index=1, key="horizonte_v3")
+    horizonte = st.selectbox("Horizonte (mensaje)", ["Mes", "Trimestre"], index=1, key="horizonte_v4")
+
+# Impactos SIEMPRE visibles (mes/trimestre/año)
+impacto_mes = float(ventas_peor * subida_eur * 1)
+impacto_trimestre = float(ventas_peor * subida_eur * 3)
+impacto_anual = float(ventas_peor * subida_eur * 12)
 
 mult = 1 if horizonte == "Mes" else 3
-impacto = float(ventas_peor * subida_eur * mult)
+impacto_msg = float(ventas_peor * subida_eur * mult)
 
 st.info(
     f"Si el **{peor_dia['dia_nombre']}** sube el ticket medio **+{subida_eur}€**, "
-    f"el impacto estimado sería **{eur(impacto)}** en **{horizonte.lower()}**."
+    f"el impacto estimado sería **{eur(impacto_msg)}** en **{horizonte.lower()}**."
 )
+
+cImp1, cImp2, cImp3 = st.columns(3)
+with cImp1:
+    st.metric("Impacto mensual", eur(impacto_mes))
+with cImp2:
+    st.metric("Impacto trimestral", eur(impacto_trimestre))
+with cImp3:
+    st.metric("Impacto anual", eur(impacto_anual))
+
 st.caption("Ejemplo de acción: pack (servicio + extra), upsell en caja, recordatorio por WhatsApp o ajuste de precios.")
 
 st.divider()
@@ -360,7 +432,10 @@ a1, a2, a3 = st.columns(3)
 with a1:
     st.success(f"1) Empujar **{top_item}** el **{peor_dia['dia_nombre']}**.")
     st.write(f"Por qué: es el día con menos ingresos (**{eur(peor_dia['ingresos'])}**).")
-    st.write(f"Impacto (escenario): +{subida_eur}€ por ticket ⇒ **{eur(impacto)}** en {horizonte.lower()}.")
+    st.write(
+        f"Impacto (escenario): +{subida_eur}€ por ticket ⇒ "
+        f"**{eur(impacto_trimestre)}** por trimestre (aprox.)."
+    )
 
 with a2:
     st.warning("2) Reducir dependencia del Top 3.")
@@ -383,7 +458,78 @@ with a3:
 st.divider()
 
 # ----------------------------
-# Gráficos (para soporte visual)
+# Recomendaciones accionables (sin subir precios)
+# ----------------------------
+st.subheader("Cómo mejorar sin subir precios (acciones sugeridas)")
+
+# Heurísticas simples (no inventan datos, solo proponen tácticas)
+top3_concentracion_alta = pct_top3 >= 55.0  # ajustable
+servicio_top = top_item
+dia_flojo = peor_dia["dia_nombre"]
+
+colR1, colR2 = st.columns(2)
+
+with colR1:
+    st.write(f"### 1) Subir ticket medio el **{dia_flojo}** (sin tocar precios)")
+    st.write("Acciones prácticas:")
+    st.markdown(
+        "- **Packs**: servicio + extra (ej: *servicio principal + tratamiento rápido*).\n"
+        "- **Add-ons** en caja: ofrece 2 opciones (A/B) para que el cliente elija.\n"
+        "- **Umbral**: “si hoy añades un extra, te incluyo X” (bonus en vez de descuento)."
+    )
+    st.caption("Objetivo: aumentar € por cliente sin subir el precio base. Mantén 2–3 opciones máximo.")
+
+with colR2:
+    st.write(f"### 2) Aprovechar tu servicio top (**{servicio_top}**)")
+    st.write("Acciones prácticas:")
+    st.markdown(
+        "- **Cross-sell natural**: añade un complemento que encaje con el servicio.\n"
+        "- **Bundle**: “servicio_top + extra recomendado” (mismo cliente, más valor).\n"
+        "- **Guion de recomendación**: “Para que dure más, te recomiendo X (2 opciones)”."
+    )
+    st.caption("Objetivo: que el top no solo genere ingresos, sino que arrastre extras.")
+
+st.write("### 3) Reducir riesgo de dependencia (Top 3)")
+if top3_concentracion_alta:
+    st.warning(
+        f"El Top 3 concentra ~{pct_top3:.1f}% de los ingresos. Eso es alto: dependes de pocos servicios."
+    )
+    st.markdown(
+        "- Crea **1 pack** para un servicio medio y empújalo 2 días/semana.\n"
+        "- Haz un **menú de extras** fijo (2–3) y mide adopción.\n"
+        "- Si tienes huecos: **lista de espera + confirmación** para reducir cancelaciones."
+    )
+else:
+    st.success(
+        f"El Top 3 concentra ~{pct_top3:.1f}% (razonable). Puedes enfocarte más en ticket medio y fidelización."
+    )
+    st.markdown(
+        "- Mantén packs simples y mide qué extras se venden.\n"
+        "- Optimiza el día flojo con una acción semanal (recordatorio + pack)."
+    )
+
+st.divider()
+
+# ----------------------------
+# Cierre comercial (para puerta fría)
+# ----------------------------
+st.subheader("Impacto económico")
+
+st.success(
+    f"Con una mejora simple (**+{subida_eur}€** por ticket) en el **{peor_dia['dia_nombre']}**, "
+    f"este negocio podría generar aproximadamente **{eur(impacto_anual)} extra al año** "
+    f"(estimación basada en el histórico del rango seleccionado)."
+)
+
+st.write(
+    "Este dashboard sirve para detectar **qué día está flojo**, **qué servicios mandan** "
+    "y **qué acción concreta** tiene más impacto. Se actualiza automáticamente cuando subes el Excel."
+)
+
+st.divider()
+
+# ----------------------------
+# Gráficos (soporte visual)
 # ----------------------------
 st.subheader("Visualización (soporte)")
 
@@ -409,7 +555,7 @@ with cC:
 st.divider()
 
 # ----------------------------
-# Datos en crudo (oculto por defecto)
+# Datos (oculto)
 # ----------------------------
 with st.expander("Ver detalle (opcional)"):
     st.dataframe(df_f.sort_values("fecha", ascending=False), use_container_width=True)
