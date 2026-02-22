@@ -1,69 +1,86 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+import pandas as pd
 
 
 @dataclass(frozen=True)
-class ImpactEstimate:
-    """Impacto estimado en € (conservador)."""
-    low_eur: float
-    high_eur: float
-    basis_eur: float          # base en rango (sin multiplicador)
-    horizon_multiplier: int   # 1/3/12
-    method: str               # "range_multiplier"
-    notes: str                # trazabilidad breve
+class SchemaConfig:
+    required_cols: tuple[str, ...] = ("fecha", "revenue", "cantidad", "producto")
+    allow_negative_revenue: bool = True
+    allow_negative_quantity: bool = True
+    drop_zero_rows: bool = False
 
 
-def _clamp_nonneg(x: float) -> float:
+def safe_date_str(dt) -> str:
     try:
-        x = float(x)
+        return pd.to_datetime(dt).date().isoformat()
     except Exception:
-        x = 0.0
-    return max(0.0, x)
+        return "-"
 
 
-def estimate_ticket_uplift_impact(
-    *,
-    tickets_in_range_for_target_day: int,
-    uplift_eur_per_ticket: float,
-    horizon_multiplier: int,
-    low_factor: float = 0.60,
-    high_factor: float = 1.20,
-) -> ImpactEstimate:
-    """Impacto por subir ticket en un día objetivo (peor día), coherente con vNext.
+def _coerce_numeric_series(s: pd.Series) -> pd.Series:
+    if s is None:
+        return pd.Series(dtype="float64")
 
-    Base (rango):
-      basis_eur = tickets_en_rango * uplift
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
 
-    Horizonte:
-      impact = basis_eur * horizon_multiplier
+    x = s.astype(str).str.strip()
+    x = x.str.replace("€", "", regex=False).str.replace("\u00A0", "", regex=False)
 
-    Rango conservador (vendible):
-      low = impact * low_factor
-      high = impact * high_factor
+    has_comma = x.str.contains(",", na=False)
+    has_dot = x.str.contains(r"\.", na=False)
 
-    Esto evita inflar por calendarios y mantiene trazabilidad.
-    """
-    t = int(max(0, tickets_in_range_for_target_day))
-    u = _clamp_nonneg(uplift_eur_per_ticket)
-    hm = int(max(1, horizon_multiplier))
+    both = has_comma & has_dot
+    if both.any():
+        last_comma = x.str.rfind(",")
+        last_dot = x.str.rfind(".")
+        es_mask = both & (last_comma > last_dot)
+        us_mask = both & ~es_mask
 
-    basis = float(t * u)
-    impact = basis * hm
+        x = x.where(~es_mask, x.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
+        x = x.where(~us_mask, x.str.replace(",", "", regex=False))
 
-    low = _clamp_nonneg(impact * float(low_factor))
-    high = _clamp_nonneg(impact * float(high_factor))
+    only_comma = has_comma & ~has_dot
+    x = x.where(~only_comma, x.str.replace(",", ".", regex=False))
 
-    # Asegura orden
-    if high < low:
-        high = low
+    return pd.to_numeric(x, errors="coerce")
 
-    return ImpactEstimate(
-        low_eur=low,
-        high_eur=high,
-        basis_eur=basis,
-        horizon_multiplier=hm,
-        method="range_multiplier",
-        notes="Base calculada EN EL RANGO; escalado por multiplicador del rango (1×/3×/12×).",
-    )
+
+def ensure_schema(df: pd.DataFrame, config: SchemaConfig | None = None) -> pd.DataFrame:
+    config = config or SchemaConfig()
+
+    if df is None or df.empty:
+        raise ValueError("Dataset vacío o None.")
+
+    missing = set(config.required_cols) - set(df.columns)
+    if missing:
+        raise ValueError(f"Faltan columnas en el dataset procesado: {sorted(missing)}")
+
+    out = df.copy()
+
+    out["fecha"] = pd.to_datetime(out["fecha"], errors="coerce")
+    out = out.dropna(subset=["fecha"])
+
+    out["revenue"] = _coerce_numeric_series(out["revenue"]).fillna(0.0).astype(float)
+    out["cantidad"] = _coerce_numeric_series(out["cantidad"]).fillna(0.0).astype(float)
+
+    out["producto"] = out["producto"].fillna("-").astype(str).str.strip()
+    out.loc[out["producto"].eq(""), "producto"] = "-"
+
+    if not config.allow_negative_revenue:
+        out = out[out["revenue"] >= 0]
+
+    if not config.allow_negative_quantity:
+        out = out[out["cantidad"] >= 0]
+
+    if config.drop_zero_rows:
+        out = out[(out["revenue"] != 0.0) | (out["cantidad"] != 0.0)]
+
+    out = out.sort_values("fecha")
+
+    if out.empty:
+        raise ValueError("Tras normalizar el schema, el dataset quedó vacío (fechas inválidas o filtros).")
+
+    return out

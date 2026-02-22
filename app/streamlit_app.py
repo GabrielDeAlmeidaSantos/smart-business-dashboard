@@ -1,26 +1,26 @@
-# app.py
+# app/streamlit_app.py
 from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-
 import json
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from analytics.schema import ensure_schema, safe_date_str
-from analytics.kpis import (
+from app.analytics.schema import ensure_schema, safe_date_str
+from app.analytics.kpis import (
     eur,
     pct_str,
     compute_kpis,
     ingresos_por_dia_semana,
     build_serie_tiempo,
 )
-from analytics.profile import detect_business_profile
-from analytics.insights import generate_insights
-from analytics.history_store import HistoryStore
-from analytics.ranking import rank_insights, select_plan
+from app.analytics.profile import detect_business_profile
+from app.analytics.insights import generate_insights
+from app.analytics.history_store import HistoryStore
+from app.analytics.ranking import rank_insights, select_plan
 
 
 # ----------------------------
@@ -30,6 +30,7 @@ from analytics.ranking import rank_insights, select_plan
 def load_data(path: str) -> pd.DataFrame:
     """Carga datos ya procesados (parquet)."""
     return pd.read_parquet(path)
+
 
 @st.cache_data(show_spinner=False)
 def load_metadata(path: str) -> dict:
@@ -41,6 +42,7 @@ def load_metadata(path: str) -> dict:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
 
 # ----------------------------
 # Auth (simple + suficiente)
@@ -154,6 +156,7 @@ st.title("Resumen del Negocio (ventas)")
 RUTA_DATOS = Path("data/processed/ventas_limpias.parquet")
 RUTA_META = Path("data/processed/metadata.json")
 
+
 # ----------------------------
 # Sidebar (cliente + auth + admin)
 # ----------------------------
@@ -257,21 +260,25 @@ if modo_admin:
                         f"Revenue p50: **{eur(s_rev.get('p50', 0.0) or 0.0)}**  |  "
                         f"p95: **{eur(s_rev.get('p95', 0.0) or 0.0)}**"
                     )
-                    st.caption(f"min={eur(s_rev.get('min', 0.0) or 0.0)} · max={eur(s_rev.get('max', 0.0) or 0.0)}")
+                    st.caption(
+                        f"min={eur(s_rev.get('min', 0.0) or 0.0)} · "
+                        f"max={eur(s_rev.get('max', 0.0) or 0.0)}"
+                    )
                 with s2:
                     st.write(
                         f"Cantidad p50: **{(s_qty.get('p50', 0.0) or 0.0):.2f}**  |  "
                         f"p95: **{(s_qty.get('p95', 0.0) or 0.0):.2f}**"
                     )
-                    st.caption(f"min={(s_qty.get('min', 0.0) or 0.0):.2f} · max={(s_qty.get('max', 0.0) or 0.0):.2f}")
+                    st.caption(
+                        f"min={(s_qty.get('min', 0.0) or 0.0):.2f} · "
+                        f"max={(s_qty.get('max', 0.0) or 0.0):.2f}"
+                    )
 
             if mapping_reverse:
                 st.markdown("**Columnas detectadas (original → estándar)**")
-                # invertimos mapping_reverse para mostrar original -> estándar
-                original_to_std = {}
-                for std_name, orig_name in mapping_reverse.items():
-                    original_to_std[str(orig_name)] = str(std_name)
+                original_to_std = {str(orig): str(std) for std, orig in mapping_reverse.items()}
                 st.json(original_to_std, expanded=False)
+
 
 # ----------------------------
 # Filtros
@@ -307,6 +314,7 @@ if df_f.empty:
 end_inclusive = pd.to_datetime(rango[1])
 period_key = f"{inicio.date().isoformat()}_{end_inclusive.date().isoformat()}"
 
+
 # ----------------------------
 # Comparativa (misma duración, periodo anterior)
 # ----------------------------
@@ -325,6 +333,7 @@ delta_uni = kpis_act.unidades - kpis_prev.unidades
 
 st.caption("📌 Flechas verdes y rojas = comparación con el **periodo anterior** de la misma duración.")
 
+
 # ----------------------------
 # Perfil detectado
 # ----------------------------
@@ -342,6 +351,7 @@ with p3:
 
 st.divider()
 
+
 # ----------------------------
 # Reutilizables (día semana)
 # ----------------------------
@@ -350,6 +360,7 @@ peor_dia = info_dias["peor"]
 mejor_dia = info_dias["mejor"]
 gap = info_dias["gap"]
 ventas_peor = info_dias["ventas_peor"]
+
 
 # ----------------------------
 # HERO + simulador (impacto coherente con rango)
@@ -378,12 +389,9 @@ with cS2:
 
 h_mult = {"1× rango": 1, "3× rango": 3, "12× rango": 12}[horizonte]
 
-# Impacto base: lo que pasaría DENTRO del rango si subes el ticket del día flojo
 impacto_rango = float(ventas_peor * subida_eur)
 impacto_horizonte = float(impacto_rango * h_mult)
 
-# “Equivalente mensual/anual” solo tiene sentido si lo basas en el rango real.
-# Si quieres, mostramos equivalente €/día basado en duración del rango.
 days_in_range = max(int((fin - inicio).days), 1)
 impacto_por_dia = impacto_rango / days_in_range
 impacto_anualizado = impacto_por_dia * 365
@@ -392,9 +400,9 @@ hero1, hero2, hero3 = st.columns([2, 1, 1])
 
 with hero1:
     st.metric(
-        "Impacto estimado",
+        "Escenario base (estimación)",
         eur(impacto_horizonte),
-        delta="estimación conservadora (extra/pack/upsell)",
+        delta="extra/pack/upsell (conservador)",
     )
     st.caption(
         f"Base: rango **{inicio.date().isoformat()} → {(fin - pd.Timedelta(days=1)).date().isoformat()}** "
@@ -403,12 +411,12 @@ with hero1:
     )
 
 with hero2:
-    st.metric("Impacto en el rango", eur(impacto_rango))
-    st.caption(f"Horizonte seleccionado: **{horizonte}**")
+    st.metric("Base en el rango", eur(impacto_rango))
+    st.caption(f"Horizonte: **{horizonte}**")
 
 with hero3:
     st.metric("Equivalente €/día (rango)", eur(impacto_por_dia))
-    st.metric("Anualizado (solo referencia)", eur(impacto_anualizado))
+    st.metric("Anualizado (referencia)", eur(impacto_anualizado))
 
 st.info(
     f"Si el **{peor_dia['dia_nombre']}** sube el ticket medio **+{subida_eur}€**, "
@@ -417,11 +425,13 @@ st.info(
 
 st.divider()
 
+
 # ----------------------------
 # Top servicios para textos
 # ----------------------------
 fig_top, top_df = fig_top_servicios(df_f, int(top_n))
 top_item = top_df.iloc[0]["producto"] if not top_df.empty else "tu servicio principal"
+
 
 # ----------------------------
 # Generar insights + ranking + plan
@@ -472,41 +482,200 @@ if modo_admin and authorized:
         )
         st.success("Plan regenerado (seguimiento reiniciado).")
 
-# ----------------------------
-# Radar (Top3 + expander)
-# ----------------------------
-st.markdown("## Radar de oportunidades (priorizado)")
 
-def render_radar(items):
-    for s in items:
+# ----------------------------
+# UX helpers (owner-friendly)
+# ----------------------------
+def _need_auth_msg():
+    st.warning("Para activar seguimiento y que el sistema aprenda, introduce el **código de acceso** (tarda 5s).")
+
+
+def _save_feedback(history_: HistoryStore, period_key_: str, insight_id_: str, status_: str, outcome_: str, note_: str):
+    ok = history_.update_item(
+        period_key=period_key_,
+        insight_id=insight_id_,
+        status=status_,
+        outcome=outcome_,
+        note=note_,
+    )
+    # update_item puede devolver bool si lo aplicaste; si no, igual guardará en tu versión antigua
+    st.toast("Guardado ✅", icon="✅")
+    return ok
+
+
+def _render_action_card(s, horizonte_label: str, authorized_: bool, history_: HistoryStore | None, period_key_: str):
+    """Tarjeta owner-friendly con botones rápidos."""
+    ins = s.insight
+    low, high = ins.estimated_impact_eur
+
+    st.markdown(f"### {ins.title}")
+    st.caption(
+        f"Impacto ({horizonte_label}): {eur(low)} – {eur(high)} · "
+        f"Esfuerzo: {ins.effort} · Tiempo: {ins.time_to_apply_min} min"
+    )
+    st.write(f"**Acción:** {ins.action_hint}")
+
+    if modo_admin:
+        with st.expander("Ver evidencia / debug", expanded=False):
+            st.caption(f"Evidencia: {ins.evidence}")
+            st.caption(f"Motivo ranking: {s.reason} | score={s.score:.2f}")
+
+    c1, c2, c3 = st.columns(3)
+    done = c1.button("✅ Hecho", use_container_width=True, key=f"done_{period_key_}_{ins.insight_id}")
+    skip = c2.button("↩️ Saltar", use_container_width=True, key=f"skip_{period_key_}_{ins.insight_id}")
+    later = c3.button("🕒 Luego", use_container_width=True, key=f"later_{period_key_}_{ins.insight_id}")
+
+    st.session_state.setdefault("fb", {})
+    key = f"{period_key_}:{ins.insight_id}"
+    st.session_state["fb"].setdefault(key, {"ask_outcome": False})
+
+    if done:
+        st.session_state["fb"][key]["ask_outcome"] = True
+        if authorized_ and history_:
+            _save_feedback(history_, period_key_, ins.insight_id, "done", "unknown", "")
+        else:
+            _need_auth_msg()
+
+    if skip:
+        st.session_state["fb"][key]["ask_outcome"] = False
+        if authorized_ and history_:
+            _save_feedback(history_, period_key_, ins.insight_id, "skipped", "unknown", "")
+        else:
+            _need_auth_msg()
+
+    if later:
+        st.session_state["fb"][key]["ask_outcome"] = False
+        if authorized_ and history_:
+            _save_feedback(history_, period_key_, ins.insight_id, "planned", "unknown", "")
+        else:
+            _need_auth_msg()
+
+    if st.session_state["fb"][key].get("ask_outcome"):
+        st.divider()
+        st.markdown("**¿Mejoró algo?**")
+        o1, o2, o3 = st.columns(3)
+        yes = o1.button("👍 Sí", use_container_width=True, key=f"out_yes_{period_key_}_{ins.insight_id}")
+        no = o2.button("👎 No", use_container_width=True, key=f"out_no_{period_key_}_{ins.insight_id}")
+        ns = o3.button("🤷 No sé", use_container_width=True, key=f"out_ns_{period_key_}_{ins.insight_id}")
+
+        note = st.text_input(
+            "Nota (opcional)",
+            key=f"note_{period_key_}_{ins.insight_id}",
+            placeholder="Ej: extra A lo aceptaron 3/10...",
+        )
+
+        chosen = None
+        if yes:
+            chosen = "improved"
+        if no:
+            chosen = "not_improved"
+        if ns:
+            chosen = "unknown"
+
+        if chosen is not None:
+            st.session_state["fb"][key]["ask_outcome"] = False
+            if authorized_ and history_:
+                _save_feedback(history_, period_key_, ins.insight_id, "done", chosen, note)
+            else:
+                _need_auth_msg()
+
+
+# ----------------------------
+# Owner View: Qué hago hoy (Top 3)
+# ----------------------------
+st.markdown("## Qué hago hoy (3 acciones)")
+st.caption("Tres acciones simples. Marca ✅ Hecho / ↩️ Saltar / 🕒 Luego. Si haces una, el sistema aprende.")
+
+if not authorized:
+    st.info("🔒 Seguimiento desactivado: introduce el código para guardar feedback y personalizar el ranking.")
+
+cA1, cA2, cA3 = st.columns(3)
+for col, s in zip([cA1, cA2, cA3], plan):
+    with col:
+        with st.container(border=True):
+            _render_action_card(
+                s=s,
+                horizonte_label=str(horizonte),
+                authorized_=authorized,
+                history_=history if authorized else None,
+                period_key_=period_key,
+            )
+
+st.divider()
+
+
+# ----------------------------
+# Seguimiento (resumen) - Owner
+# ----------------------------
+st.markdown("## Seguimiento")
+st.caption("Acciones guardadas para este periodo (solo lectura). Esto alimenta el ranking futuro.")
+
+period_data = history.get_period(period_key)
+
+if period_data is None:
+    if not authorized:
+        st.warning("No hay seguimiento guardado. Introduce el código para activar guardado.")
+    else:
+        st.info("Aún no hay plan guardado para este periodo. (Se crea al generar plan o al hacer clic en una acción).")
+else:
+    items = period_data.get("items") or []
+    if not items:
+        st.info("Plan guardado, pero sin items. (Admin puede regenerar el plan).")
+    else:
+        rows = []
+        for it in items:
+            rows.append(
+                {
+                    "insight_id": it.get("insight_id", "-"),
+                    "status": it.get("status", "planned"),
+                    "outcome": it.get("outcome", "unknown"),
+                    "updated_at": it.get("updated_at", "-"),
+                    "note": it.get("note", ""),
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+st.divider()
+
+
+# ----------------------------
+# Radar (admin / detalle)
+# ----------------------------
+st.markdown("## Radar de oportunidades")
+st.caption("Owner: Top 3. Admin: ranking completo y explicación.")
+
+with st.expander("Ver Top 3 (detalle)", expanded=modo_admin):
+    for s in ranked[:3]:
         ins = s.insight
         low, high = ins.estimated_impact_eur
-
         st.markdown(f"**💰 {ins.title}**")
-        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-
-        with c1:
-            # antes era trigger; ahora usamos evidencia (más honesto y numérico)
-            st.caption(ins.evidence)
-
-        with c2:
-            st.write(f"**Impacto ({horizonte}):** {eur(low)} – {eur(high)}")
-
-        with c3:
-            st.write(f"**Esfuerzo:** {ins.effort}")
-
-        with c4:
-            st.write(f"**Tiempo:** {ins.time_to_apply_min} min")
-
+        st.caption(
+            f"Impacto ({horizonte}): {eur(low)} – {eur(high)} · "
+            f"Esfuerzo: {ins.effort} · Tiempo: {ins.time_to_apply_min} min"
+        )
         st.write(f"**Acción:** {ins.action_hint}")
         if modo_admin:
+            st.caption(f"Evidencia: {ins.evidence}")
             st.caption(f"Motivo ranking: {s.reason} | score={s.score:.2f}")
         st.divider()
 
-render_radar(ranked[:3])
+if modo_admin:
+    with st.expander("Admin: ver radar completo", expanded=False):
+        for s in ranked[:10]:
+            ins = s.insight
+            low, high = ins.estimated_impact_eur
+            st.markdown(f"**💰 {ins.title}**")
+            st.caption(
+                f"Impacto ({horizonte}): {eur(low)} – {eur(high)} · "
+                f"Esfuerzo: {ins.effort} · Tiempo: {ins.time_to_apply_min} min"
+            )
+            st.write(f"**Acción:** {ins.action_hint}")
+            st.caption(f"Evidencia: {ins.evidence}")
+            st.caption(f"Motivo ranking: {s.reason} | score={s.score:.2f}")
+            st.divider()
 
-with st.expander("Ver radar completo"):
-    render_radar(ranked[3:10])
+st.divider()
+
 
 # ----------------------------
 # Resumen ejecutivo
@@ -525,99 +694,6 @@ with cE3:
 
 st.divider()
 
-# ----------------------------
-# Plan de mejora (dinámico)
-# ----------------------------
-st.markdown("## Plan de mejora (3 acciones) — dinámico")
-
-cols = st.columns(3)
-for col, s in zip(cols, plan):
-    ins = s.insight
-    low, high = ins.estimated_impact_eur
-    with col:
-        st.success(ins.title)
-        st.write(f"**Impacto ({horizonte}):** {eur(low)} – {eur(high)}")
-        st.write(f"**Esfuerzo:** {ins.effort} | **Tiempo:** {ins.time_to_apply_min} min")
-        st.write(f"**Acción:** {ins.action_hint}")
-        st.caption(f"Evidencia: {ins.evidence}")
-        if modo_admin:
-            st.caption(f"Motivo ranking: {s.reason}")
-
-st.divider()
-
-# ----------------------------
-# Seguimiento (feedback propietario)
-# ----------------------------
-st.markdown("## Seguimiento (para que no se repita y el sistema aprenda)")
-st.caption("Marca si se aplicó y si funcionó. Esto afecta el ranking futuro.")
-
-period_data = history.get_period(period_key)
-
-if period_data is None:
-    st.warning(f"No hay plan guardado para {period_key}. Si estás autorizado, activa autoguardado o usa admin.")
-else:
-    items = period_data.get("items") or []
-    if len(items) == 0:
-        st.warning("Plan vacío en historial. Regenera plan en admin o revisa autoguardado.")
-    else:
-        for it in items:
-            iid = it.get("insight_id")
-            status = it.get("status", "planned")
-            outcome = it.get("outcome", "unknown")
-            note = it.get("note", "")
-
-            st.write(f"**{iid}**")
-            c1, c2, c3 = st.columns([1, 1, 2])
-            with c1:
-                new_status = st.selectbox(
-                    "Aplicación",
-                    ["planned", "done", "skipped"],
-                    index=["planned", "done", "skipped"].index(status) if status in ["planned", "done", "skipped"] else 0,
-                    key=f"status_{period_key}_{iid}",
-                    help="done=lo hice; skipped=no lo hice; planned=pendiente",
-                )
-            with c2:
-                if new_status == "done":
-                    new_outcome = st.selectbox(
-                        "Resultado",
-                        ["unknown", "improved", "not_improved"],
-                        index=["unknown", "improved", "not_improved"].index(outcome)
-                        if outcome in ["unknown", "improved", "not_improved"]
-                        else 0,
-                        key=f"outcome_{period_key}_{iid}",
-                        help="improved=mejoró KPI; not_improved=no mejoró",
-                    )
-                else:
-                    st.selectbox(
-                        "Resultado",
-                        ["unknown"],
-                        index=0,
-                        key=f"outcome_{period_key}_{iid}_locked",
-                        help="Solo puedes marcar resultado cuando el estado es done.",
-                    )
-                    new_outcome = "unknown"
-            with c3:
-                new_note = st.text_input(
-                    "Nota (opcional)",
-                    value=str(note),
-                    key=f"note_{period_key}_{iid}",
-                    placeholder="Ej: ofrecí extra A, lo aceptó 3 de 10 clientes...",
-                )
-
-            if st.button("Guardar seguimiento", key=f"save_{period_key}_{iid}"):
-                if not authorized:
-                    st.error("No autorizado: introduce el código para guardar cambios.")
-                else:
-                    history.update_item(
-                        period_key=period_key,
-                        insight_id=iid,
-                        status=new_status,
-                        outcome=new_outcome,
-                        note=new_note,
-                    )
-                    st.success("Guardado.")
-
-            st.divider()
 
 # ----------------------------
 # KPIs principales
@@ -647,6 +723,7 @@ k4.metric(
 
 st.divider()
 
+
 # ----------------------------
 # Impacto final
 # ----------------------------
@@ -659,11 +736,10 @@ st.caption(
     f"Referencia anualizada (solo para tener escala): **{eur(impacto_anualizado)}**/año "
     f"≈ **{eur(impacto_por_dia)}**/día."
 )
-st.write(
-    "Esto se recalcula automáticamente al actualizar el Excel y te deja claro qué palanca atacar y cuánto dinero mueve."
-)
+st.write("Esto se recalcula al actualizar el Excel y te deja claro qué palanca atacar y cuánto dinero mueve.")
 
 st.divider()
+
 
 # ----------------------------
 # Visualización (soporte)
