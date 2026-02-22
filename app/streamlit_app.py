@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+import json
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -11,7 +12,6 @@ import streamlit as st
 from analytics.schema import ensure_schema, safe_date_str
 from analytics.kpis import (
     eur,
-    eur_day_from_annual,
     pct_str,
     compute_kpis,
     ingresos_por_dia_semana,
@@ -31,6 +31,16 @@ def load_data(path: str) -> pd.DataFrame:
     """Carga datos ya procesados (parquet)."""
     return pd.read_parquet(path)
 
+@st.cache_data(show_spinner=False)
+def load_metadata(path: str) -> dict:
+    """Carga metadata del pipeline (json)."""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 # ----------------------------
 # Auth (simple + suficiente)
@@ -142,7 +152,7 @@ st.set_page_config(page_title="Resumen del Negocio", layout="wide")
 st.title("Resumen del Negocio (ventas)")
 
 RUTA_DATOS = Path("data/processed/ventas_limpias.parquet")
-
+RUTA_META = Path("data/processed/metadata.json")
 
 # ----------------------------
 # Sidebar (cliente + auth + admin)
@@ -208,6 +218,60 @@ st.caption(
     f"Datos procesados: {safe_date_str(df['fecha'].min())} → {safe_date_str(df['fecha'].max())}"
     f"  |  Registros: {len(df):,}".replace(",", ".")
 )
+
+# ----------------------------
+# Metadata del pipeline (solo admin)
+# ----------------------------
+meta = {}
+if modo_admin:
+    meta = load_metadata(str(RUTA_META))
+
+    with st.expander("🛠️ Admin · Metadata del pipeline (debug)"):
+        if not meta:
+            st.warning("No se encontró metadata.json. Ejecuta el pipeline para generarla.")
+        else:
+            stats = meta.get("stats") or {}
+            mapping = (meta.get("mapping") or {})
+            mapping_reverse = (mapping.get("mapping_reverse") or {})
+
+            cM1, cM2, cM3 = st.columns(3)
+            with cM1:
+                st.metric("price_mode", str(stats.get("price_mode", "-")))
+                st.metric("revenue_source", str(stats.get("revenue_source", "-")))
+            with cM2:
+                st.metric("rows_raw", int(meta.get("rows_raw", 0)))
+                st.metric("rows_clean", int(meta.get("rows_clean", 0)))
+            with cM3:
+                st.metric("date_min", str(meta.get("date_min", "-")))
+                st.metric("date_max", str(meta.get("date_max", "-")))
+
+            sanity = (stats.get("sanity") or {})
+            if sanity:
+                s_rev = sanity.get("revenue") or {}
+                s_qty = sanity.get("cantidad") or {}
+
+                st.markdown("**Sanity (percentiles)**")
+                s1, s2 = st.columns(2)
+                with s1:
+                    st.write(
+                        f"Revenue p50: **{eur(s_rev.get('p50', 0.0) or 0.0)}**  |  "
+                        f"p95: **{eur(s_rev.get('p95', 0.0) or 0.0)}**"
+                    )
+                    st.caption(f"min={eur(s_rev.get('min', 0.0) or 0.0)} · max={eur(s_rev.get('max', 0.0) or 0.0)}")
+                with s2:
+                    st.write(
+                        f"Cantidad p50: **{(s_qty.get('p50', 0.0) or 0.0):.2f}**  |  "
+                        f"p95: **{(s_qty.get('p95', 0.0) or 0.0):.2f}**"
+                    )
+                    st.caption(f"min={(s_qty.get('min', 0.0) or 0.0):.2f} · max={(s_qty.get('max', 0.0) or 0.0):.2f}")
+
+            if mapping_reverse:
+                st.markdown("**Columnas detectadas (original → estándar)**")
+                # invertimos mapping_reverse para mostrar original -> estándar
+                original_to_std = {}
+                for std_name, orig_name in mapping_reverse.items():
+                    original_to_std[str(orig_name)] = str(std_name)
+                st.json(original_to_std, expanded=False)
 
 # ----------------------------
 # Filtros
