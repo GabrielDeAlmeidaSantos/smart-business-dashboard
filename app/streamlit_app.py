@@ -163,7 +163,9 @@ RUTA_META = Path("data/processed/metadata.json")
 with st.sidebar:
     st.header("Controles")
 
-    modo_admin = st.toggle("Modo admin", value=False)
+    modo_admin = False
+    if True:
+        modo_admin = st.toggle("Modo admin", value=False)
     st.caption("Filtra fechas y mira el resumen en segundos.")
     st.divider()
 
@@ -587,7 +589,7 @@ st.markdown("## Qué hago hoy (3 acciones)")
 st.caption("Tres acciones simples. Marca ✅ Hecho / ↩️ Saltar / 🕒 Luego. Si haces una, el sistema aprende.")
 
 if not authorized:
-    st.info("🔒 Seguimiento desactivado: introduce el código para guardar feedback y personalizar el ranking.")
+    st.caption("🔒 Para guardar el progreso, activa el acceso (opcional).")
 
 cA1, cA2, cA3 = st.columns(3)
 for col, s in zip([cA1, cA2, cA3], plan):
