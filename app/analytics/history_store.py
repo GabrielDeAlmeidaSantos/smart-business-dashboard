@@ -1,6 +1,9 @@
+# app/analytics/history_store.py
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -11,22 +14,71 @@ def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+_CLIENT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def _validate_client_id(client_id: str) -> str:
+    cid = str(client_id or "").strip()
+    if not _CLIENT_ID_RE.match(cid):
+        raise ValueError(
+            "client_id inválido. Usa solo letras/números/guion/guion_bajo (1-64 chars)."
+        )
+    return cid
+
+
+def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
+    """Escritura atómica: write -> tmp -> replace. También crea .bak antes si existe."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    bak_path = path.with_suffix(path.suffix + ".bak")
+
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+
+    # 1) escribir tmp
+    tmp_path.write_text(payload, encoding="utf-8")
+
+    # 2) backup del actual si existe (best-effort)
+    try:
+        if path.exists():
+            # os.replace sobreescribe si .bak ya existía (lo cual es OK)
+            os.replace(str(path), str(bak_path))
+    except Exception:
+        # si falla el backup, no abortamos (pero la escritura atómica sigue)
+        pass
+
+    # 3) replace atómico (cross-platform overwrite)
+    os.replace(str(tmp_path), str(path))
+
+
+def _safe_load_json(path: Path) -> Optional[Dict[str, Any]]:
+    """Carga JSON; devuelve None si no puede."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+        return None
+    except Exception:
+        return None
+
+
 @dataclass
 class HistoryStore:
-    """JSON persistence for per-client plans and feedback.
+    """JSON persistence for per-client plans and feedback (schema v1).
 
-    File schema (legacy v1, still valid):
+    Schema:
     {
       "schema_version": 1,
       "client_id": "default",
       "recommendations": [
         {
-          "period": "YYYY-MM-DD_YYYY-MM-DD",  # period_key basado en rango (vNext)
+          "period": "YYYY-MM-DD_YYYY-MM-DD",
           "generated_at": "...",
           "meta": {...},
           "items": [
             {
-              "insight_id": "uplift_worst_day_ticket",
+              "insight_id": "...",
               "status": "planned" | "done" | "skipped",
               "outcome": "unknown" | "improved" | "not_improved",
               "note": "",
@@ -37,31 +89,64 @@ class HistoryStore:
       ]
     }
     """
+
     client_id: str
     path: Path
+
+    def __post_init__(self) -> None:
+        # Evita ids raros (y posibles traversal)
+        self.client_id = _validate_client_id(self.client_id)
 
     def ensure_parent(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
+    def _empty(self) -> Dict[str, Any]:
+        return {"schema_version": 1, "client_id": self.client_id, "recommendations": []}
+
     def load(self) -> Dict[str, Any]:
+        """Carga history.json; si está corrupto intenta .bak; si no, devuelve estructura vacía."""
         self.ensure_parent()
+
         if not self.path.exists():
-            return {"schema_version": 1, "client_id": self.client_id, "recommendations": []}
+            return self._empty()
+
+        data = _safe_load_json(self.path)
+        if data is None:
+            # Intentar recuperación desde backup
+            bak = self.path.with_suffix(self.path.suffix + ".bak")
+            bak_data = _safe_load_json(bak) if bak.exists() else None
+            if isinstance(bak_data, dict):
+                data = bak_data
+            else:
+                # No reseteamos el archivo original aquí (para no perder evidencia).
+                return self._empty()
+
+        # Normalizar estructura
+        data.setdefault("schema_version", 1)
+        data.setdefault("client_id", self.client_id)
+        data.setdefault("recommendations", [])
+
+        # Asegurar tipo correcto
+        if not isinstance(data.get("recommendations"), list):
+            data["recommendations"] = []
+
+        # Orden estable por generated_at (si falta, lo manda al final)
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("History file root is not a dict.")
-            data.setdefault("schema_version", 1)
-            data.setdefault("client_id", self.client_id)
-            data.setdefault("recommendations", [])
-            return data
+            def _k(r: dict) -> str:
+                return str(r.get("generated_at") or "9999-12-31T23:59:59")
+            data["recommendations"] = sorted(
+                [r for r in data["recommendations"] if isinstance(r, dict)],
+                key=_k,
+            )
         except Exception:
-            # Si está corrupto, arranca limpio (mejorable: backup)
-            return {"schema_version": 1, "client_id": self.client_id, "recommendations": []}
+            pass
+
+        return data
 
     def save(self, data: Dict[str, Any]) -> None:
+        """Guarda de forma atómica (+ backup)."""
         self.ensure_parent()
-        self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(self.path, data)
 
     def get_period(self, period_key: str) -> Optional[Dict[str, Any]]:
         data = self.load()
@@ -71,20 +156,17 @@ class HistoryStore:
         return None
 
     def upsert_period_plan(self, period_key: str, insight_ids: list[str], meta: dict | None = None) -> None:
-        """Create plan for period if missing; if exists, update ONLY if it has no items yet.
-
-        This prevents overwriting feedback.
-        """
+        """Crea plan si no existe; si existe, actualiza SOLO si no tiene items (no machaca feedback)."""
         data = self.load()
         recs = data.get("recommendations") or []
 
-        existing = None
+        existing: Optional[Dict[str, Any]] = None
         for r in recs:
             if r.get("period") == period_key:
                 existing = r
                 break
 
-        def _new_items():
+        def _new_items() -> list[Dict[str, Any]]:
             return [
                 {
                     "insight_id": iid,
@@ -110,6 +192,10 @@ class HistoryStore:
             return
 
         items = existing.get("items") or []
+        if not isinstance(items, list):
+            items = []
+            existing["items"] = items
+
         if len(items) == 0:
             existing["items"] = _new_items()
             existing["meta"] = meta or existing.get("meta") or {}
@@ -117,7 +203,7 @@ class HistoryStore:
             self.save(data)
 
     def force_replace_period_plan(self, period_key: str, insight_ids: list[str], meta: dict | None = None) -> None:
-        """Admin-only: replace plan list (resetea seguimiento)."""
+        """Admin-only: reemplaza plan (resetea seguimiento)."""
         data = self.load()
         recs = data.get("recommendations") or []
 
@@ -147,11 +233,16 @@ class HistoryStore:
         status: str | None = None,
         outcome: str | None = None,
         note: str | None = None,
+        *,
+        create_if_missing: bool = False,
     ) -> bool:
-        """Update a specific item inside a period.
+        """Actualiza un item dentro de un periodo.
+
+        Args:
+            create_if_missing: si True y el item no existe pero el periodo sí, lo crea.
 
         Returns:
-            True if updated, False if period/item not found.
+            True si actualiza/crea, False si no existe el periodo (o item y create_if_missing=False).
         """
         data = self.load()
         recs = data.get("recommendations") or []
@@ -161,34 +252,42 @@ class HistoryStore:
                 continue
 
             items = r.get("items") or []
+            if not isinstance(items, list):
+                items = []
+                r["items"] = items
+
+            target = None
             for it in items:
-                if it.get("insight_id") != insight_id:
-                    continue
+                if isinstance(it, dict) and it.get("insight_id") == insight_id:
+                    target = it
+                    break
 
-                if status is not None:
-                    it["status"] = str(status)
+            if target is None:
+                if not create_if_missing:
+                    return False
+                target = {
+                    "insight_id": insight_id,
+                    "status": "planned",
+                    "outcome": "unknown",
+                    "note": "",
+                    "updated_at": _now_iso(),
+                }
+                items.append(target)
 
-                    # Guardrail: outcome solo tiene sentido si status == done
-                    if str(status).strip().lower() != "done":
-                        it["outcome"] = "unknown"
+            if status is not None:
+                target["status"] = str(status)
+                if str(status).strip().lower() != "done":
+                    target["outcome"] = "unknown"
 
-                if outcome is not None:
-                    # Guardrail: no permitimos outcome != unknown si no está done
-                    current_status = str(it.get("status", "planned")).strip().lower()
-                    if current_status == "done":
-                        it["outcome"] = str(outcome)
-                    else:
-                        it["outcome"] = "unknown"
+            if outcome is not None:
+                current_status = str(target.get("status", "planned")).strip().lower()
+                target["outcome"] = str(outcome) if current_status == "done" else "unknown"
 
-                if note is not None:
-                    it["note"] = str(note)
+            if note is not None:
+                target["note"] = str(note)
 
-                it["updated_at"] = _now_iso()
-                self.save(data)
-                return True
+            target["updated_at"] = _now_iso()
+            self.save(data)
+            return True
 
-            # Period existe pero no encontramos item
-            return False
-
-        # Period no existe
         return False

@@ -1,7 +1,8 @@
+# app/analytics/kpis.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import pandas as pd
 
@@ -20,15 +21,18 @@ def eur(x: float) -> str:
     return f"{s} €"
 
 
-def pct_str(delta: float, base: float) -> str:
-    """Devuelve '+3.2%' o '-1.1%' (si base=0 => '')."""
+def pct_str(delta: float, base: float, *, eps: float = 1e-9) -> str:
+    """Devuelve '+3.2%' o '-1.1%'. Si base≈0 => '' para evitar porcentajes sin sentido."""
     try:
         base = float(base)
+        delta = float(delta)
     except Exception:
-        base = 0.0
-    if base == 0.0:
         return ""
-    p = (float(delta) / base) * 100.0
+
+    if abs(base) < eps:
+        return ""
+
+    p = (delta / base) * 100.0
     sign = "+" if p >= 0 else ""
     return f"{sign}{p:.1f}%"
 
@@ -63,8 +67,16 @@ class KPIBundle:
     ventas: int
     ticket: float
     unidades: float
+
     granularity: str  # "ticket" o "row"
     note: str         # explicación breve para admin/debug
+
+    # Etiquetas “honestas” para UI
+    ventas_label: str
+    ticket_label: str
+
+    # Calidad (mínimo útil para warnings)
+    quality: Dict[str, Any]
 
 
 # ----------------------------
@@ -76,18 +88,31 @@ def _ensure_cols(df: pd.DataFrame, cols: list[str]) -> None:
         raise ValueError(f"Faltan columnas para KPIs: {missing}")
 
 
-def _as_ticket_level(df: pd.DataFrame, cfg: KPIConfig) -> pd.DataFrame:
+def _detect_ticket_id_col(df: pd.DataFrame, cfg: KPIConfig) -> Optional[str]:
+    """Auto-detect simple: si cfg.ticket_id_col viene None, intenta 'ticket_id'."""
+    if cfg.ticket_id_col and cfg.ticket_id_col in df.columns:
+        return cfg.ticket_id_col
+    if cfg.ticket_id_col is None and "ticket_id" in df.columns:
+        # solo lo usamos si tiene algo (no todo NaN)
+        try:
+            if df["ticket_id"].notna().any():
+                return "ticket_id"
+        except Exception:
+            return None
+    return None
+
+
+def _as_ticket_level(df: pd.DataFrame, cfg: KPIConfig, ticket_col: str) -> pd.DataFrame:
     """
-    Convierte a nivel ticket si ticket_id_col existe.
-    Devuelve un df con una fila por ticket:
-      - fecha: min fecha por ticket (o primera)
+    Convierte a nivel ticket.
+    Devuelve df con una fila por ticket:
+      - fecha: min fecha por ticket
       - revenue: suma revenue por ticket
       - cantidad: suma cantidad por ticket
-      - producto: (opcional) no se usa aquí; se mantiene fuera
     """
-    _ensure_cols(df, [cfg.ticket_id_col, cfg.date_col, cfg.revenue_col, cfg.qty_col])  # type: ignore[arg-type]
+    _ensure_cols(df, [ticket_col, cfg.date_col, cfg.revenue_col, cfg.qty_col])
 
-    g = df.groupby(cfg.ticket_id_col, as_index=False).agg(
+    g = df.groupby(ticket_col, as_index=False).agg(
         **{
             cfg.date_col: (cfg.date_col, "min"),
             cfg.revenue_col: (cfg.revenue_col, "sum"),
@@ -97,15 +122,33 @@ def _as_ticket_level(df: pd.DataFrame, cfg: KPIConfig) -> pd.DataFrame:
     return g
 
 
+def _quality_report(df: pd.DataFrame, cfg: KPIConfig, *, ticket_mode: bool) -> Dict[str, Any]:
+    """Métricas básicas de calidad para warnings."""
+    q: Dict[str, Any] = {}
+    try:
+        q["rows"] = int(len(df))
+        q["pct_nan_revenue"] = float(df[cfg.revenue_col].isna().mean() * 100.0) if cfg.revenue_col in df.columns else None
+        q["pct_nan_qty"] = float(df[cfg.qty_col].isna().mean() * 100.0) if cfg.qty_col in df.columns else None
+        q["ticket_mode"] = bool(ticket_mode)
+    except Exception:
+        return {"rows": int(len(df)), "ticket_mode": bool(ticket_mode)}
+    return q
+
+
 # ----------------------------
 # KPIs
 # ----------------------------
 def compute_kpis(df_: pd.DataFrame, cfg: KPIConfig | None = None) -> KPIBundle:
-    """KPIs robustos con fallback honesto."""
+    """KPIs robustos con fallback honesto + autodetección de ticket_id."""
     cfg = cfg or KPIConfig()
 
     if df_ is None or df_.empty:
-        return KPIBundle(ingresos=0.0, ventas=0, ticket=0.0, unidades=0.0, granularity="row", note="empty")
+        return KPIBundle(
+            ingresos=0.0, ventas=0, ticket=0.0, unidades=0.0,
+            granularity="row", note="empty",
+            ventas_label="Líneas", ticket_label="Importe medio por línea",
+            quality={"rows": 0, "ticket_mode": False},
+        )
 
     _ensure_cols(df_, [cfg.date_col, cfg.revenue_col, cfg.qty_col])
 
@@ -114,20 +157,26 @@ def compute_kpis(df_: pd.DataFrame, cfg: KPIConfig | None = None) -> KPIBundle:
     if not cfg.allow_negative_revenue:
         df = df[df[cfg.revenue_col] >= 0]
 
-    # Modo ticket si hay ticket_id_col y existe
-    if cfg.ticket_id_col and cfg.ticket_id_col in df.columns:
-        df_t = _as_ticket_level(df, cfg)
+    ticket_col = _detect_ticket_id_col(df, cfg)
+
+    # Modo ticket si hay ticket_id_col válido
+    if ticket_col:
+        df_t = _as_ticket_level(df, cfg, ticket_col=ticket_col)
         ingresos = float(df_t[cfg.revenue_col].sum())
         ventas = int(df_t.shape[0])
         ticket = float(ingresos / ventas) if ventas else 0.0
         unidades = float(df_t[cfg.qty_col].sum())
+
         return KPIBundle(
             ingresos=ingresos,
             ventas=ventas,
             ticket=ticket,
             unidades=unidades,
             granularity="ticket",
-            note=f"by_ticket({cfg.ticket_id_col})",
+            note=f"by_ticket({ticket_col})",
+            ventas_label="Tickets",
+            ticket_label="Ticket medio",
+            quality=_quality_report(df_t, cfg, ticket_mode=True),
         )
 
     # Fallback: 1 fila = 1 ticket (aprox)
@@ -135,6 +184,7 @@ def compute_kpis(df_: pd.DataFrame, cfg: KPIConfig | None = None) -> KPIBundle:
     ventas = int(df.shape[0])
     ticket = float(ingresos / ventas) if ventas else 0.0
     unidades = float(df[cfg.qty_col].sum())
+
     return KPIBundle(
         ingresos=ingresos,
         ventas=ventas,
@@ -142,6 +192,9 @@ def compute_kpis(df_: pd.DataFrame, cfg: KPIConfig | None = None) -> KPIBundle:
         unidades=unidades,
         granularity="row",
         note="fallback_row_equals_ticket",
+        ventas_label="Líneas (aprox.)",
+        ticket_label="Importe medio por línea (aprox.)",
+        quality=_quality_report(df, cfg, ticket_mode=False),
     )
 
 
@@ -149,12 +202,7 @@ def compute_kpis(df_: pd.DataFrame, cfg: KPIConfig | None = None) -> KPIBundle:
 # Ingresos por día de semana (y ventas del peor día)
 # ----------------------------
 def ingresos_por_dia_semana(df_f: pd.DataFrame, cfg: KPIConfig | None = None):
-    """Ingresos por día de semana + info (mejor/peor/gap/ventas_peor).
-
-    ventas_peor:
-      - si modo ticket: nº de tickets del peor día en el rango
-      - si fallback row: nº de filas del peor día (aprox tickets)
-    """
+    """Ingresos por día de semana + info (mejor/peor/gap/ventas_peor)."""
     cfg = cfg or KPIConfig()
     _ensure_cols(df_f, [cfg.date_col, cfg.revenue_col])
 
@@ -183,16 +231,18 @@ def ingresos_por_dia_semana(df_f: pd.DataFrame, cfg: KPIConfig | None = None):
     mejor = ingresos_dia.sort_values("ingresos", ascending=False).iloc[0]
     gap = float(mejor["ingresos"] - peor["ingresos"])
 
-    # Ventas (tickets) por día:
-    if cfg.ticket_id_col and cfg.ticket_id_col in df_sem.columns:
+    ticket_col = _detect_ticket_id_col(df_sem, cfg)
+
+    # Ventas por día
+    if ticket_col:
         ventas_por_dia = (
-            df_sem.groupby("dia_nombre")[cfg.ticket_id_col]
+            df_sem.groupby("dia_nombre")[ticket_col]
             .nunique()
             .reset_index()
-            .rename(columns={cfg.ticket_id_col: "ventas"})
+            .rename(columns={ticket_col: "ventas"})
         )
         granularity = "ticket"
-        note = f"by_ticket({cfg.ticket_id_col})"
+        note = f"by_ticket({ticket_col})"
     else:
         ventas_por_dia = (
             df_sem.groupby("dia_nombre", as_index=False)
@@ -232,6 +282,7 @@ def build_serie_tiempo(df_f: pd.DataFrame, agrupacion: str, cfg: KPIConfig | Non
     if agrupacion == "Día":
         df_temp["periodo"] = df_temp[cfg.date_col].dt.floor("D")
     elif agrupacion == "Semana":
+        # Inicio de semana “anclado” (pandas Period.start_time)
         df_temp["periodo"] = df_temp[cfg.date_col].dt.to_period("W-MON").apply(lambda r: r.start_time)
     else:  # Mes
         df_temp["periodo"] = df_temp[cfg.date_col].dt.to_period("M").dt.to_timestamp()

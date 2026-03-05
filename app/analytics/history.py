@@ -1,10 +1,23 @@
+# app/analytics/history.py
 from __future__ import annotations
 
-import json
+"""
+LEGACY COMPAT LAYER (NO USAR PARA NUEVO CÓDIGO)
+
+Este módulo existía con un HistoryStore antiguo (no atómico, esquema distinto).
+Para evitar romper imports legacy, lo convertimos en wrapper del HistoryStore nuevo
+(app/analytics/history_store.py), que escribe de forma atómica y con backup.
+
+Si encuentras imports antiguos:
+  from .history import HistoryStore
+se mantendrán funcionando, pero internamente usan el store nuevo.
+"""
+
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Literal
+from typing import Any, Optional, Literal, Dict, List
 
+from .history_store import HistoryStore as _NewHistoryStore
 
 Outcome = Literal["unknown", "improved", "not_improved"]
 
@@ -12,94 +25,52 @@ Outcome = Literal["unknown", "improved", "not_improved"]
 @dataclass
 class HistoryStore:
     """
-    Historial por cliente.
+    Wrapper compatible con la interfaz legacy, respaldado por HistoryStore nuevo.
 
-    Estructura:
-      {
-        "recommendations": [
-          {
-            "period": "YYYY-MM",
-            "items": [
-              {
-                "insight_id": "...",
-                "applied": false,
-                "outcome": "unknown|improved|not_improved",
-                "notes": "",
-                "kpi_before": null,
-                "kpi_after": null
-              }, ...
-            ],
-            "meta": {"generated_at": "...", ...}
-          }, ...
-        ]
-      }
+    IMPORTANTE:
+    - El store nuevo usa schema v1:
+        {"schema_version":1, "client_id":..., "recommendations":[{period, generated_at, meta, items:[{insight_id,status,outcome,note,updated_at}]}]}
+    - Este wrapper traduce:
+        legacy applied -> status
+        legacy notes   -> note
     """
     path: Path
 
-    def load(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return {"recommendations": []}
-        return json.loads(self.path.read_text(encoding="utf-8"))
+    def _store(self) -> _NewHistoryStore:
+        # client_id no está en el schema legacy, lo inferimos del path si se puede
+        # fallback: "default"
+        cid = "default"
+        try:
+            # .../data/clients/<client_id>/history.json
+            parts = list(self.path.parts)
+            if "clients" in parts:
+                i = parts.index("clients")
+                if i + 1 < len(parts):
+                    cid = str(parts[i + 1])
+        except Exception:
+            pass
+        return _NewHistoryStore(client_id=cid, path=self.path)
 
-    def save(self, data: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    # ------------- Legacy-like API -------------
+
+    def load(self) -> Dict[str, Any]:
+        """Devuelve el esquema NUEVO (no el legacy)."""
+        return self._store().load()
+
+    def save(self, data: Dict[str, Any]) -> None:
+        """Guarda usando escritura atómica del store nuevo."""
+        self._store().save(data)
 
     def upsert_period_plan(
         self,
         period_key: str,
-        insight_ids: list[str],
-        meta: Optional[dict[str, Any]] = None,
+        insight_ids: List[str],
+        meta: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
-        Crea o reemplaza el plan del periodo.
-        Mantiene los estados previos si el insight ya existía en ese periodo.
+        Crea plan del periodo si no existe (no machaca feedback) usando store nuevo.
         """
-        data = self.load()
-        recs = data.get("recommendations") or []
-
-        existing = None
-        for r in recs:
-            if r.get("period") == period_key:
-                existing = r
-                break
-
-        old_items_by_id = {}
-        if existing:
-            for it in (existing.get("items") or []):
-                old_items_by_id[str(it.get("insight_id"))] = it
-
-        new_items = []
-        for iid in insight_ids:
-            prev = old_items_by_id.get(iid, {})
-            new_items.append(
-                {
-                    "insight_id": iid,
-                    "applied": bool(prev.get("applied", False)),
-                    "outcome": prev.get("outcome", "unknown"),
-                    "notes": prev.get("notes", ""),
-                    "kpi_before": prev.get("kpi_before", None),
-                    "kpi_after": prev.get("kpi_after", None),
-                }
-            )
-
-        payload = {
-            "period": period_key,
-            "items": new_items,
-            "meta": meta or {},
-        }
-
-        if existing:
-            # replace in place
-            for i, r in enumerate(recs):
-                if r.get("period") == period_key:
-                    recs[i] = payload
-                    break
-        else:
-            recs.append(payload)
-
-        data["recommendations"] = recs
-        self.save(data)
+        self._store().upsert_period_plan(period_key=period_key, insight_ids=insight_ids, meta=meta or {})
 
     def update_item(
         self,
@@ -108,70 +79,69 @@ class HistoryStore:
         applied: Optional[bool] = None,
         outcome: Optional[str] = None,
         notes: Optional[str] = None,
-        kpi_before: Optional[float] = None,
-        kpi_after: Optional[float] = None,
+        kpi_before: Optional[float] = None,  # legacy: ignorado en v1
+        kpi_after: Optional[float] = None,   # legacy: ignorado en v1
     ) -> None:
         """
-        Actualiza seguimiento de 1 insight dentro de 1 periodo.
+        Traducción:
+          applied True  -> status="done"
+          applied False -> status="planned"
+          outcome -> outcome (solo si status done, el store nuevo ya aplica guardrail)
+          notes -> note
         """
-        data = self.load()
-        recs = data.get("recommendations") or []
+        status = None
+        if applied is not None:
+            status = "done" if bool(applied) else "planned"
 
-        for r in recs:
-            if r.get("period") != period_key:
-                continue
-            items = r.get("items") or []
-            for it in items:
-                if str(it.get("insight_id")) != insight_id:
-                    continue
-                if applied is not None:
-                    it["applied"] = bool(applied)
-                if outcome is not None:
-                    it["outcome"] = outcome
-                if notes is not None:
-                    it["notes"] = notes
-                if kpi_before is not None:
-                    it["kpi_before"] = float(kpi_before)
-                if kpi_after is not None:
-                    it["kpi_after"] = float(kpi_after)
-                self.save(data)
-                return
+        # store nuevo tiene guardrails y admite create_if_missing
+        self._store().update_item(
+            period_key=period_key,
+            insight_id=insight_id,
+            status=status,
+            outcome=outcome,
+            note=notes,
+            create_if_missing=True,
+        )
 
-        # si no existe el periodo o el insight, no hace nada (evita corrupción)
-        self.save(data)
+    # ------------- Legacy scoring helpers (best-effort) -------------
 
     def repetition_penalty(self, insight_id: str, last_n: int = 2) -> float:
         """
         Penaliza si el insight se recomendó recientemente.
+        Implementación best-effort sobre store nuevo:
+          - mira últimos `last_n` periodos en recommendations
         """
-        data = self.load()
-        recs = (data.get("recommendations") or [])[-last_n:]
+        data = self._store().load()
+        recs = data.get("recommendations") or []
+        if not isinstance(recs, list):
+            return 0.0
+        recent = recs[-int(max(1, last_n)) :]
         hits = 0
-        for r in recs:
+        for r in recent:
             for it in (r.get("items") or []):
-                if str(it.get("insight_id")) == insight_id:
+                if str(it.get("insight_id")) == str(insight_id):
                     hits += 1
         return min(0.2 * hits, 0.4)
 
     def outcome_bonus(self, insight_id: str, lookback: int = 6) -> float:
         """
-        Bonus/malus según histórico:
+        Bonus/malus según outcome reciente (best-effort):
           improved => +0.25
           not_improved => -0.20
-        Usa las últimas `lookback` entradas.
         """
-        data = self.load()
-        recs = (data.get("recommendations") or [])[-lookback:]
+        data = self._store().load()
+        recs = data.get("recommendations") or []
+        if not isinstance(recs, list):
+            return 0.0
+        recent = recs[-int(max(1, lookback)) :]
         best = 0.0
-
-        for r in recs:
+        for r in recent:
             for it in (r.get("items") or []):
-                if str(it.get("insight_id")) != insight_id:
+                if str(it.get("insight_id")) != str(insight_id):
                     continue
-                outcome = str(it.get("outcome", "unknown"))
-                if outcome == "improved":
+                out = str(it.get("outcome", "unknown"))
+                if out == "improved":
                     best = max(best, 0.25)
-                elif outcome == "not_improved":
-                    best = max(best, -0.20)
-
+                elif out == "not_improved":
+                    best = min(best, -0.20)
         return best

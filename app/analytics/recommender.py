@@ -1,79 +1,38 @@
+# app/analytics/recommender.py
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import List
 
 from .insights import Insight
-from .history import HistoryStore
+from .history_store import HistoryStore
+from .ranking import ScoredInsight, rank_insights as _rank_insights, select_plan as _select_plan
 
 
 @dataclass(frozen=True)
 class RankedInsight:
+    """
+    Compat legacy: mismo concepto que ScoredInsight, pero con nombre antiguo.
+    """
     insight: Insight
     score: float
     reason: str
 
 
-def _impact_bonus(impact_range: tuple[float, float]) -> float:
+def rank_insights(insights: List[Insight], history: HistoryStore, *, period_key: str) -> List[RankedInsight]:
     """
-    Convierte impacto (€) a bonus pequeño y estable (0..0.25 aprox).
-    No queremos que el impacto domine la confianza.
+    Wrapper legacy sobre app/analytics/ranking.py.
+    Mantiene API simple y garantiza una sola fuente de verdad.
     """
-    low, high = impact_range
-    mid = (low + high) / 2.0
-    # Escala suave: 0€ -> 0, 500€ -> ~0.15, 1500€ -> ~0.25
-    if mid <= 0:
-        return 0.0
-    if mid >= 1500:
-        return 0.25
-    return 0.25 * (mid / 1500.0)
+    scored: List[ScoredInsight] = _rank_insights(insights, history, period_key=period_key)
+    return [RankedInsight(insight=s.insight, score=s.score, reason=s.reason) for s in scored]
 
 
-def rank_insights(insights: list[Insight], history: HistoryStore) -> list[RankedInsight]:
+def pick_plan(ranked: List[RankedInsight], k: int = 3) -> List[RankedInsight]:
     """
-    Score = confianza + bonus ingresos + bonus impacto - repetición + outcome_bonus.
+    Wrapper legacy: aplica la misma lógica de diversidad usando select_plan del ranking real.
     """
-    ranked: list[RankedInsight] = []
-
-    for ins in insights:
-        base = float(ins.confidence)
-
-        bonus_revenue = 0.12 if ins.impact_type == "revenue" else 0.0
-        bonus_impact = _impact_bonus(ins.estimated_impact_eur)
-
-        penalty_repeat = history.repetition_penalty(ins.id, last_n=2)
-        bonus_outcome = history.outcome_bonus(ins.id, lookback=6)
-
-        score = base + bonus_revenue + bonus_impact - penalty_repeat + bonus_outcome
-
-        reason = (
-            f"conf={base:.2f}"
-            f"{'+rev' if bonus_revenue else ''}"
-            f"+imp({bonus_impact:.2f})"
-        )
-        if penalty_repeat:
-            reason += f"-rep({penalty_repeat:.2f})"
-        if bonus_outcome:
-            reason += f"+hist({bonus_outcome:.2f})"
-
-        ranked.append(RankedInsight(insight=ins, score=float(score), reason=reason))
-
-    ranked.sort(key=lambda x: x.score, reverse=True)
-    return ranked
-
-
-def pick_plan(ranked: list[RankedInsight], k: int = 3) -> list[RankedInsight]:
-    """
-    Selecciona k insights evitando duplicados.
-    """
-    chosen: list[RankedInsight] = []
-    seen = set()
-
-    for r in ranked:
-        if r.insight.id in seen:
-            continue
-        chosen.append(r)
-        seen.add(r.insight.id)
-        if len(chosen) >= k:
-            break
-
-    return chosen
+    # Convertimos a ScoredInsight para reaprovechar select_plan (diversidad por kpi_target, etc.)
+    scored = [ScoredInsight(insight=r.insight, score=r.score, reason=r.reason) for r in ranked]
+    picked = _select_plan(scored, k=k, require_revenue_for_owner=True)
+    return [RankedInsight(insight=s.insight, score=s.score, reason=s.reason) for s in picked]
