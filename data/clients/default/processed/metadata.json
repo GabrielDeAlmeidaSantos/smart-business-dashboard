@@ -1,33 +1,93 @@
 {
   "input": {
-    "path": "data\\clients\\default\\input\\upload_20260307_171624.xlsx",
+    "path": "data\\clients\\default\\input\\upload_20260307_203223.xlsx",
     "kind": ".xlsx",
     "sheet_used": "Sheet1",
+    "available_sheets": [
+      "Sheet1"
+    ],
     "csv_sep": null,
-    "csv_encoding": null
+    "csv_encoding": null,
+    "rows_loaded": 8,
+    "cols_loaded": 5
   },
-  "rows_raw": 4436,
-  "rows_norm": 4436,
-  "rows_clean": 4436,
+  "rows_raw": 8,
+  "rows_norm": 8,
+  "rows_clean": 6,
   "mapping": {
     "mapping_detected": {
-      "Fecha de venta": "fecha",
-      "Servicio": "producto",
-      "Unidades": "cantidad",
-      "Precio unitario": "precio_unitario"
+      "Fecha venta": "fecha",
+      "Producto/servicio": "producto",
+      "Cantidad vendida": "cantidad",
+      "Importe total": "importe_total",
+      "Ticket": "ticket_id"
     },
     "mapping_reverse": {
-      "fecha": "Fecha de venta",
-      "producto": "Servicio",
-      "cantidad": "Unidades",
-      "precio_unitario": "Precio unitario"
+      "fecha": "Fecha venta",
+      "producto": "Producto/servicio",
+      "cantidad": "Cantidad vendida",
+      "importe_total": "Importe total",
+      "ticket_id": "Ticket"
     },
     "mapping_collisions": {},
+    "mapping_diagnostics": {
+      "fecha": {
+        "candidates": [
+          "Fecha venta"
+        ],
+        "selected": "Fecha venta",
+        "scores": {
+          "Fecha venta": 0.8938
+        }
+      },
+      "producto": {
+        "candidates": [
+          "Producto/servicio"
+        ],
+        "selected": "Producto/servicio",
+        "scores": {
+          "Producto/servicio": 1.0
+        }
+      },
+      "cantidad": {
+        "candidates": [
+          "Cantidad vendida"
+        ],
+        "selected": "Cantidad vendida",
+        "scores": {
+          "Cantidad vendida": 1.0
+        }
+      },
+      "precio_unitario": {
+        "candidates": [],
+        "selected": null,
+        "scores": {}
+      },
+      "importe_total": {
+        "candidates": [
+          "Importe total"
+        ],
+        "selected": "Importe total",
+        "scores": {
+          "Importe total": 0.975
+        }
+      },
+      "ticket_id": {
+        "candidates": [
+          "Ticket"
+        ],
+        "selected": "Ticket",
+        "scores": {
+          "Ticket": 1.0
+        }
+      }
+    },
     "original_columns": [
-      "Fecha de venta",
-      "Servicio",
-      "Unidades",
-      "Precio unitario"
+      "Fecha venta",
+      "Producto/servicio",
+      "Cantidad vendida",
+      "Importe total",
+      "Ticket"
     ],
     "normalized_columns": [
       "fecha",
@@ -36,50 +96,79 @@
       "precio_unitario",
       "importe_total",
       "ticket_id"
+    ],
+    "missing_internal_columns_filled": [
+      "precio_unitario"
     ]
   },
   "stats": {
-    "rows_in": 4436,
+    "rows_in": 8,
     "rows_dropped_all_nan": 0,
-    "rows_dropped_na_core": 0,
-    "rows_dropped_rules": 0,
-    "price_mode": "unit_price",
-    "revenue_source": "precio_unitario*cantidad",
+    "rows_dropped_na_core": 1,
+    "rows_dropped_rules": 1,
+    "rows_with_placeholder_producto": 1,
+    "rows_with_ticket_id": 5,
+    "ticket_id_coverage": 0.8333,
+    "price_mode": "line_total",
+    "revenue_source": "importe_total",
+    "revenue_source_confidence": "alta",
+    "granularity": "exacta",
+    "metric_exactness": {
+      "revenue_total": "exacta",
+      "unidades_vendidas": "exacta",
+      "operaciones": "exacta",
+      "ticket_medio": "exacta",
+      "top_productos": "exacta",
+      "comparacion_temporal": "exacta"
+    },
     "allow_negative_revenue": false,
-    "placeholders_producto": 0,
+    "missing_key_input_columns": [],
+    "input_column_coverage": {
+      "fecha": 1.0,
+      "producto": 0.875,
+      "cantidad": 1.0,
+      "precio_unitario": 0.0,
+      "importe_total": 1.0,
+      "ticket_id": 0.875,
+      "importe_total_valid": 0.8333,
+      "precio_unitario_valid": 0.0
+    },
     "sanity": {
       "cantidad": {
         "min": 1.0,
         "p05": 1.0,
         "p50": 1.0,
-        "p95": 1.0,
+        "p95": 2.0,
         "max": 2.0
       },
       "precio_unitario": {
-        "min": 9.9,
-        "p05": 10.95,
-        "p50": 29.645,
-        "p95": 44.86,
-        "max": 61.57
-      },
-      "importe_total": {
         "min": null,
         "p05": null,
         "p50": null,
         "p95": null,
         "max": null
       },
+      "importe_total": {
+        "min": -11.9,
+        "p05": -8.925,
+        "p50": 31.5,
+        "p95": 58.0,
+        "max": 58.0
+      },
       "revenue": {
-        "min": 9.9,
-        "p05": 10.95,
-        "p50": 29.675,
-        "p95": 44.86,
-        "max": 61.57
+        "min": 0.0,
+        "p05": 0.0,
+        "p50": 31.5,
+        "p95": 58.0,
+        "max": 58.0
       }
-    }
+    },
+    "warnings": [
+      "hay_filas_sin_producto_util"
+    ]
   },
   "date_min": "2025-01-01 00:00:00",
-  "date_max": "2025-12-26 00:00:00",
+  "date_max": "2025-01-06 00:00:00",
   "columns_out": [
     "fecha",
     "producto",
@@ -88,5 +177,10 @@
     "importe_total",
     "ticket_id",
     "revenue"
-  ]
+  ],
+  "pipeline_notes": {
+    "revenue_total": "Se considera exacto si revenue se pudo construir con cobertura suficiente.",
+    "ordenes_y_ticket": "Son exactos solo cuando ticket_id tiene buena cobertura; si no, se tratan como aproximados.",
+    "perfilado_y_recomendaciones": "Pierden precisión si producto tiene muchos placeholders o faltan columnas clave."
+  }
 }
