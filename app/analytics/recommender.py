@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import List, Optional
 
 from .history_store import HistoryStore
+from .ranking import ScoredRecommendation, score_recommendations, select_plan
 from .recommendation_library import (
     RecommendationCard,
     apply_history_penalty,
     build_recommendation_cards,
-    select_top_cards,
 )
 
 
@@ -18,11 +18,7 @@ from .recommendation_library import (
 @dataclass(frozen=True)
 class RecommendationResult:
     """
-    Resultado final del motor para una recomendación concreta.
-    Ya viene listo para:
-    - Owner
-    - Admin
-    - seguimiento posterior
+    Resultado final listo para UI Owner/Admin.
     """
 
     card: RecommendationCard
@@ -35,6 +31,7 @@ class RecommendationPlan:
     """
     Plan final preparado para la UI.
     """
+
     top_cards: List[RecommendationResult]
     all_cards: List[RecommendationResult]
 
@@ -42,93 +39,36 @@ class RecommendationPlan:
 # ============================================================
 # Helpers internos
 # ============================================================
-def _safe_history_summary(
-    history: Optional[HistoryStore],
-    *,
-    client_id: Optional[str] = None,
-    period_key: Optional[str] = None,
-) -> dict:
+def _safe_history_summary(history: Optional[HistoryStore]) -> dict:
     """
-    Intenta obtener un resumen de histórico sin romper si la API real
-    del HistoryStore aún no está completamente cerrada.
-
-    Esto permite avanzar el MVP sin bloquearte por la capa de persistencia.
+    Obtiene un resumen compacto del histórico sin romper el flujo
+    si no hay store o si el método no existe.
     """
     if history is None:
         return {}
 
-    # Caso ideal: el store ya expone un resumen útil
-    for method_name in (
-        "get_history_summary",
-        "build_history_summary",
-        "summary_for_period",
-        "get_period_summary",
-    ):
-        method = getattr(history, method_name, None)
-        if callable(method):
-            try:
-                if client_id is not None and period_key is not None:
-                    return method(client_id=client_id, period_key=period_key) or {}
-                if period_key is not None:
-                    return method(period_key=period_key) or {}
-                return method() or {}
-            except TypeError:
-                try:
-                    return method(period_key=period_key) or {}
-                except Exception:
-                    pass
-            except Exception:
-                pass
+    method = getattr(history, "get_history_summary", None)
+    if callable(method):
+        try:
+            return method() or {}
+        except Exception:
+            return {}
 
     return {}
 
 
-def _score_reason(card: RecommendationCard, history_summary: dict | None = None) -> str:
+def _to_results(scored: List[ScoredRecommendation]) -> List[RecommendationResult]:
     """
-    Explicación corta y comercial del porqué queda priorizada.
+    Convierte ScoredRecommendation -> RecommendationResult.
     """
-    history_summary = history_summary or {}
-
-    reason_parts: list[str] = []
-
-    if card.priority_label == "alta":
-        reason_parts.append("prioridad alta por contexto actual")
-    elif card.priority_label == "media":
-        reason_parts.append("prioridad media por potencial y facilidad")
-    else:
-        reason_parts.append("prioridad baja pero útil como prueba complementaria")
-
-    if card.confidence_label:
-        reason_parts.append(f"confianza {card.confidence_label}")
-
-    if card.effort == "bajo":
-        reason_parts.append("esfuerzo bajo")
-
-    if card.insight_id in set(history_summary.get("recent_positive", [])):
-        reason_parts.append("alineada con aprendizaje positivo reciente")
-
-    if card.insight_id in set(history_summary.get("already_doing", [])):
-        reason_parts.append("ya existe contexto previo en el negocio")
-
-    return " · ".join(reason_parts)
-
-
-def _materialize_results(cards: Iterable[RecommendationCard], history_summary: dict | None = None) -> list[RecommendationResult]:
-    """
-    Convierte cards en resultados finales con score explícito.
-    """
-    results: list[RecommendationResult] = []
-
-    for card in cards:
-        results.append(
-            RecommendationResult(
-                card=card,
-                score=card.priority_weight,
-                reason=_score_reason(card, history_summary=history_summary),
-            )
+    return [
+        RecommendationResult(
+            card=s.card,
+            score=s.score,
+            reason=s.reason,
         )
-
-    return sorted(results, key=lambda x: x.score, reverse=True)
+        for s in scored
+    ]
 
 
 # ============================================================
@@ -149,15 +89,20 @@ def build_recommendation_plan(
 
     Flujo:
     1) genera cards candidatas según contexto + vertical
-    2) aplica histórico
-    3) ordena
-    4) selecciona top cards para Owner
+    2) aplica ajuste ligero por histórico resumido (rotación / ya lo hacen / etc.)
+    3) pasa por scoring real del ranking
+    4) selecciona top cards para Owner con diversidad pragmática
+
+    Notas:
+    - client_id y period_key se mantienen por compatibilidad de interfaz,
+      aunque el store ya suele venir instanciado por cliente.
+    - la capa de histórico existe dos veces a propósito:
+      a) apply_history_penalty() = rotación ligera
+      b) score_recommendations() = ajuste más serio por histórico real
     """
-    history_summary = _safe_history_summary(
-        history,
-        client_id=client_id,
-        period_key=period_key,
-    )
+    _ = client_id, period_key  # compatibilidad explícita; no se usan de forma directa aquí
+
+    history_summary = _safe_history_summary(history)
 
     base_cards = build_recommendation_cards(
         ctx=ctx,
@@ -165,30 +110,24 @@ def build_recommendation_plan(
         subtype=subtype,
     )
 
-    rescored_cards = apply_history_penalty(
+    cards_after_history_penalty = apply_history_penalty(
         base_cards,
         history_summary=history_summary,
     )
 
-    all_results = _materialize_results(
-        rescored_cards,
-        history_summary=history_summary,
+    scored_cards = score_recommendations(
+        cards_after_history_penalty,
+        history_store=history,
     )
 
-    top_cards_raw = select_top_cards(
-        [r.card for r in all_results],
+    top_scored = select_plan(
+        scored_cards,
         k=top_k,
     )
 
-    top_ids = {c.insight_id for c in top_cards_raw}
-    top_results = [r for r in all_results if r.card.insight_id in top_ids]
-
-    # Reordenar top por score descendente
-    top_results = sorted(top_results, key=lambda x: x.score, reverse=True)
-
     return RecommendationPlan(
-        top_cards=top_results,
-        all_cards=all_results,
+        top_cards=_to_results(top_scored),
+        all_cards=_to_results(scored_cards),
     )
 
 
@@ -199,8 +138,9 @@ def build_recommendation_plan(
 class RankedInsight:
     """
     Compatibilidad temporal con la interfaz antigua.
-    Ojo: ya no representa un Insight clásico, sino una recomendación operativa.
+    Ya no representa un Insight clásico, sino una recomendación operativa.
     """
+
     insight: RecommendationCard
     score: float
     reason: str

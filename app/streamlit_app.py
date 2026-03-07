@@ -18,11 +18,7 @@ from app.analytics.kpis import (
 )
 from app.analytics.profile import detect_business_profile
 from app.analytics.history_store import HistoryStore
-from app.analytics.recommendation_library import (
-    build_recommendation_cards,
-    apply_history_penalty,
-    select_top_cards,
-)
+from app.analytics.recommender import build_recommendation_plan
 
 # Pipeline (para uploader)
 from src.pipeline import PipelinePaths, run_pipeline
@@ -59,7 +55,6 @@ def is_authorized(client_id: str, code: str) -> bool:
         return str(code).strip() == str(expected).strip()
     except Exception:
         return False
-
 
 
 def available_client_ids() -> list[str]:
@@ -110,7 +105,6 @@ def fig_ingresos_tiempo(serie: pd.DataFrame, agrupacion: str):
     return fig
 
 
-
 def fig_top_servicios(df_f: pd.DataFrame, top_n: int):
     """Figura: top productos/servicios por ingresos + tabla top."""
     top = (
@@ -139,7 +133,6 @@ def fig_top_servicios(df_f: pd.DataFrame, top_n: int):
     fig.update_xaxes(title_text="Ingresos (€)")
     fig.update_yaxes(title_text="Producto/Servicio", autorange="reversed")
     return fig, top
-
 
 
 def fig_ingresos_dia_semana(ingresos_dia: pd.DataFrame):
@@ -208,42 +201,6 @@ def build_owner_summary(
     return frases
 
 
-
-def build_history_summary(history: HistoryStore, period_key: str) -> dict:
-    """
-    Resume el histórico del periodo para favorecer rotación.
-    """
-    period_data = history.get_period(period_key) or {}
-    items = period_data.get("items") or []
-
-    recent_done: list[str] = []
-    recent_seen: list[str] = []
-    already_doing: list[str] = []
-
-    for it in items:
-        insight_id = str(it.get("insight_id", "")).strip()
-        if not insight_id:
-            continue
-
-        recent_seen.append(insight_id)
-
-        status = str(it.get("status", "")).strip().lower()
-        outcome = str(it.get("outcome", "")).strip().lower()
-
-        if status == "done":
-            recent_done.append(insight_id)
-
-        if outcome == "already_doing":
-            already_doing.append(insight_id)
-
-    return {
-        "recent_done": list(set(recent_done)),
-        "recent_seen": list(set(recent_seen)),
-        "already_doing": list(set(already_doing)),
-    }
-
-
-
 def top_item_share_pct(top_df: pd.DataFrame, df_f: pd.DataFrame) -> float:
     """Peso porcentual del top 1 sobre ingresos totales."""
     if top_df.empty or df_f.empty:
@@ -255,7 +212,6 @@ def top_item_share_pct(top_df: pd.DataFrame, df_f: pd.DataFrame) -> float:
     return (top_value / total) * 100.0
 
 
-
 def owner_metric_labels(granularity: str) -> tuple[str, str]:
     """
     Etiquetas más entendibles para Owner.
@@ -263,6 +219,25 @@ def owner_metric_labels(granularity: str) -> tuple[str, str]:
     if granularity == "ticket":
         return ("Tickets", "Importe medio por ticket")
     return ("Operaciones registradas", "Importe medio por operación (aprox.)")
+
+
+def dataset_readiness_label(meta: dict, granularity: str) -> tuple[str, str]:
+    """
+    Etiqueta simple de calidad de lectura para Owner.
+    """
+    stats = meta.get("stats") or {}
+    placeholders = int(stats.get("placeholders_producto", 0) or 0)
+    collisions = stats.get("mapping_collisions_count")
+    if collisions is None:
+        mapping = meta.get("mapping") or {}
+        mapping_collisions = mapping.get("mapping_collisions") or {}
+        collisions = len(mapping_collisions) if isinstance(mapping_collisions, dict) else 0
+
+    if granularity == "ticket" and placeholders == 0 and int(collisions) == 0:
+        return ("alta", "Lectura sólida del periodo. El detalle disponible permite recomendaciones más fiables.")
+    if granularity == "ticket":
+        return ("media", "Lectura correcta, pero conviene revisar algunos detalles de calidad de datos.")
+    return ("media", "Lectura útil, pero parte de las estimaciones se ajustan de forma prudente al detalle disponible.")
 
 
 # ----------------------------
@@ -490,6 +465,11 @@ ventas_peor = int(max(1, round(ventas_peor_raw * conservative_factor)))
 fig_top, top_df = fig_top_servicios(df_f, int(top_n))
 top_item = top_df.iloc[0]["producto"] if not top_df.empty else "tu servicio principal"
 
+# Store histórico
+history_path = Path("data/clients") / client_id / "history.json"
+history_path.parent.mkdir(parents=True, exist_ok=True)
+history = HistoryStore(client_id=client_id, path=history_path)
+
 
 # ----------------------------
 # Owner tab
@@ -511,14 +491,15 @@ with tab_owner:
         st.write(f"- {frase}")
 
     if meta:
-        calidad_lectura = "alta" if info_dias.get("granularity") == "ticket" else "media"
-        st.caption(
-            f"Lectura del periodo: {calidad_lectura}. Las estimaciones se ajustan al detalle disponible."
+        calidad_lectura, lectura_msg = dataset_readiness_label(
+            meta=meta,
+            granularity=info_dias.get("granularity", "row"),
         )
+        st.caption(f"Lectura del periodo: {calidad_lectura}. {lectura_msg}")
 
     st.divider()
 
-    # KPIs primero: contexto antes de recomendar acciones
+    # KPIs
     st.markdown("## Resumen del periodo")
     st.caption("Comparado con el periodo anterior de la misma duración.")
 
@@ -551,7 +532,7 @@ with tab_owner:
     # Oportunidad principal
     st.markdown("## La oportunidad más clara ahora")
     st.caption(
-        "Esta es la mejora con más potencial según los datos actuales, sin depender de descuentos."
+        "Esta es una estimación orientativa basada en mejorar el día flojo sin depender de descuentos."
     )
 
     cS1, cS2 = st.columns([2, 1])
@@ -588,7 +569,8 @@ with tab_owner:
         st.caption(
             f"Rango: {inicio.date().isoformat()} → {(fin - pd.Timedelta(days=1)).date().isoformat()} "
             f"({days_in_range} días) | Día flojo: **{peor_dia['dia_nombre']}** | "
-            f"Base de cálculo: {ventas_peor_raw} {('tickets' if gran == 'ticket' else 'registros')} (ajustado a {ventas_peor})."
+            f"Base de cálculo: {ventas_peor_raw} {('tickets' if gran == 'ticket' else 'registros')} "
+            f"(ajustado a {ventas_peor})."
         )
     with hero2:
         st.metric("Impacto en este periodo", eur(impacto_rango))
@@ -605,11 +587,7 @@ with tab_owner:
 
     st.divider()
 
-    # Recomendaciones del motor nuevo
-    history_path = Path("data/clients") / client_id / "history.json"
-    history_path.parent.mkdir(parents=True, exist_ok=True)
-    history = HistoryStore(client_id=client_id, path=history_path)
-
+    # Contexto para recomendaciones
     delta_ing_pct = 0.0
     if kpis_prev.ingresos and float(kpis_prev.ingresos) != 0.0:
         delta_ing_pct = (
@@ -633,20 +611,20 @@ with tab_owner:
         "granularity_label": granularity_label,
     }
 
-    raw_cards = build_recommendation_cards(
+    recommendation_plan = build_recommendation_plan(
         ctx=recommendation_ctx,
         business_type=profile.business_type,
         subtype=profile.subtype,
+        history=history,
+        client_id=client_id,
+        period_key=period_key,
+        top_k=3,
     )
-
-    history_summary = build_history_summary(history, period_key)
-    rescored_cards = apply_history_penalty(raw_cards, history_summary)
-    plan = select_top_cards(rescored_cards, k=3)
 
     if autoguardar and authorized and (history.get_period(period_key) is None):
         history.upsert_period_plan(
             period_key=period_key,
-            insight_ids=[x.insight_id for x in plan],
+            insight_ids=[x.card.insight_id for x in recommendation_plan.top_cards],
             meta={
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
                 "business_type": profile.business_type,
@@ -656,58 +634,55 @@ with tab_owner:
             },
         )
 
-    def _need_auth_msg():
-        st.warning("Para guardar seguimiento, introduce el código del negocio.")
-
-    def _save_feedback(
-        history_: HistoryStore,
-        period_key_: str,
-        insight_id_: str,
-        status_: str,
-        outcome_: str,
-        note_: str,
-    ):
-        ok = history_.update_item(
-            period_key=period_key_,
-            insight_id=insight_id_,
-            status=status_,
-            outcome=outcome_,
-            note=note_,
-            create_if_missing=True,
-        )
-        if ok:
-            st.toast("Guardado ✅", icon="✅")
-        return ok
-
     def _render_action_card(
-        card,
+        rec_result,
         horizonte_label: str,
         authorized_: bool,
         history_: HistoryStore | None,
         period_key_: str,
     ):
+        """
+        Render de una recomendación orientada a experimento.
+        rec_result es RecommendationResult.
+        """
+        card = rec_result.card
         low, high = card.estimated_impact_eur
 
         st.markdown(f"### {card.title}")
         st.caption(
-            f"Impacto orientativo ({horizonte_label}): {eur(low)} – {eur(high)} · "
-            f"Esfuerzo: {card.effort} · Tiempo: {card.time_to_apply_min} min"
+            f"Prioridad: {card.priority_label} · "
+            f"Confianza: {card.confidence_label} · "
+            f"Impacto orientativo ({horizonte_label}): {eur(low)} – {eur(high)}"
         )
 
         st.write(f"**Por qué aparece ahora:** {card.why_now}")
-        st.write(f"**Qué podrías probar:** {card.action}")
+        st.write(f"**Qué probar:** {card.action}")
 
-        with st.expander("Cómo aplicarlo", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption(f"**Dónde aplicarlo:** {card.where_to_apply}")
+            st.caption(f"**Tiempo de aplicación:** {card.time_to_apply_min} min")
+            st.caption(f"**Revisión:** {card.review_window_label}")
+        with c2:
+            st.caption(f"**Esfuerzo:** {card.effort}")
+            st.caption(f"**Objetivo:** {card.goal}")
+            st.caption(f"**Score:** {rec_result.score:.2f}")
+
+        with st.expander("Ver experimento completo", expanded=False):
+            st.write(f"**Hipótesis:** {card.hypothesis}")
+            st.write(f"**Qué mediremos:** {card.primary_metric_label}")
+
+            if card.secondary_metric_labels:
+                st.write(
+                    "**Métricas secundarias:** "
+                    + ", ".join(card.secondary_metric_labels)
+                )
+
+            st.write(f"**Qué consideramos éxito:** {card.success_rule_text}")
             st.write(f"**Si ya lo haces:** {card.if_already_doing}")
             st.write(f"**Estrategia sugerida:** {card.strategy}")
+            st.caption(f"Motivo del ranking: {rec_result.reason}")
 
-            c_info1, c_info2 = st.columns(2)
-            with c_info1:
-                st.caption(f"Objetivo: {card.goal}")
-            with c_info2:
-                st.caption("Priorizada según datos actuales e histórico reciente.")
-
-        # Botones en 2 filas para que no se rompa el layout
         row1_col1, row1_col2 = st.columns(2)
         done = row1_col1.button(
             "✅ Hecho",
@@ -739,78 +714,119 @@ with tab_owner:
         if done:
             st.session_state["fb"][key]["ask_outcome"] = True
             if authorized_ and history_:
-                _save_feedback(history_, period_key_, card.insight_id, "done", "unknown", "")
+                history_.update_item(
+                    period_key=period_key_,
+                    insight_id=card.insight_id,
+                    status="done",
+                    outcome="unknown",
+                    primary_metric_key=card.primary_metric_key,
+                    primary_metric_label=card.primary_metric_label,
+                    create_if_missing=True,
+                )
+                st.toast("Guardado ✅", icon="✅")
             else:
-                _need_auth_msg()
+                st.warning("Para guardar seguimiento, introduce el código del negocio.")
 
         if skip:
             st.session_state["fb"][key]["ask_outcome"] = False
             if authorized_ and history_:
-                _save_feedback(history_, period_key_, card.insight_id, "skipped", "unknown", "")
+                history_.update_item(
+                    period_key=period_key_,
+                    insight_id=card.insight_id,
+                    status="skipped",
+                    outcome="unknown",
+                    create_if_missing=True,
+                )
+                st.toast("Guardado ✅", icon="✅")
             else:
-                _need_auth_msg()
+                st.warning("Para guardar seguimiento, introduce el código del negocio.")
 
         if later:
             st.session_state["fb"][key]["ask_outcome"] = False
             if authorized_ and history_:
-                _save_feedback(history_, period_key_, card.insight_id, "planned", "unknown", "")
+                history_.update_item(
+                    period_key=period_key_,
+                    insight_id=card.insight_id,
+                    status="active",
+                    outcome="unknown",
+                    primary_metric_key=card.primary_metric_key,
+                    primary_metric_label=card.primary_metric_label,
+                    create_if_missing=True,
+                )
+                st.toast("Guardado ✅", icon="✅")
             else:
-                _need_auth_msg()
+                st.warning("Para guardar seguimiento, introduce el código del negocio.")
 
         if already:
             st.session_state["fb"][key]["ask_outcome"] = False
             if authorized_ and history_:
-                _save_feedback(
-                    history_,
-                    period_key_,
-                    card.insight_id,
-                    "done",
-                    "already_doing",
-                    "Ya lo hacen en el negocio",
+                history_.update_item(
+                    period_key=period_key_,
+                    insight_id=card.insight_id,
+                    status="already_doing",
+                    outcome="unknown",
+                    note="Ya lo hacen en el negocio",
+                    primary_metric_key=card.primary_metric_key,
+                    primary_metric_label=card.primary_metric_label,
+                    create_if_missing=True,
                 )
+                st.toast("Guardado ✅", icon="✅")
             else:
-                _need_auth_msg()
+                st.warning("Para guardar seguimiento, introduce el código del negocio.")
 
         if st.session_state["fb"][key].get("ask_outcome"):
             st.divider()
-            st.markdown("**¿Mejoró algo?**")
+            st.markdown("**¿Qué pasó al probarlo?**")
+
             o1, o2, o3 = st.columns(3)
             yes = o1.button(
-                "👍 Sí",
+                "👍 Mejoró",
                 use_container_width=True,
                 key=f"out_yes_{period_key_}_{card.insight_id}",
             )
             no = o2.button(
-                "👎 No",
+                "👎 No mejoró",
                 use_container_width=True,
                 key=f"out_no_{period_key_}_{card.insight_id}",
             )
-            ns = o3.button(
-                "🤷 No lo sé",
+            inc = o3.button(
+                "🤷 Inconcluso",
                 use_container_width=True,
-                key=f"out_ns_{period_key_}_{card.insight_id}",
+                key=f"out_inc_{period_key_}_{card.insight_id}",
             )
 
             note = st.text_input(
-                "Nota (opcional)",
+                "Aprendizaje / nota (opcional)",
                 key=f"note_{period_key_}_{card.insight_id}",
-                placeholder="Ej: funcionó mejor por la tarde...",
+                placeholder="Ej: funcionó mejor por la tarde, pero no fue constante...",
             )
 
             chosen = None
             if yes:
                 chosen = "improved"
-            if no:
+            elif no:
                 chosen = "not_improved"
-            if ns:
-                chosen = "unknown"
+            elif inc:
+                chosen = "inconclusive"
 
             if chosen is not None:
                 st.session_state["fb"][key]["ask_outcome"] = False
                 if authorized_ and history_:
-                    _save_feedback(history_, period_key_, card.insight_id, "done", chosen, note)
+                    history_.update_item(
+                        period_key=period_key_,
+                        insight_id=card.insight_id,
+                        status="done",
+                        outcome=chosen,
+                        note=note,
+                        learning_note=note,
+                        reviewed_at=datetime.now().isoformat(timespec="seconds"),
+                        primary_metric_key=card.primary_metric_key,
+                        primary_metric_label=card.primary_metric_label,
+                        create_if_missing=True,
+                    )
+                    st.toast("Resultado guardado ✅", icon="✅")
                 else:
-                    _need_auth_msg()
+                    st.warning("Para guardar seguimiento, introduce el código del negocio.")
 
     # Acciones del día
     st.markdown("## Acciones recomendadas para hoy")
@@ -821,19 +837,41 @@ with tab_owner:
     if not authorized:
         st.caption("🔒 Si quieres guardar progreso, activa el acceso con el código del negocio.")
 
-    if not plan:
+    if not recommendation_plan.top_cards:
         st.info("Todavía no hay recomendaciones activas para este periodo con las reglas actuales.")
     else:
-        action_cols = st.columns(len(plan))
-        for col, card in zip(action_cols, plan):
+        action_cols = st.columns(len(recommendation_plan.top_cards))
+        for col, rec_result in zip(action_cols, recommendation_plan.top_cards):
             with col:
                 with st.container(border=True):
                     _render_action_card(
-                        card=card,
+                        rec_result=rec_result,
                         horizonte_label=str(horizonte),
                         authorized_=authorized,
                         history_=history if authorized else None,
                         period_key_=period_key,
+                    )
+
+    # Aprendizajes recientes
+    if authorized:
+        st.divider()
+        st.markdown("## Aprendizajes recientes")
+        st.caption("Lo último que el sistema recuerda sobre acciones probadas.")
+
+        learnings = history.get_recent_learnings(limit=5)
+        if not learnings:
+            st.info("Todavía no hay aprendizajes guardados.")
+        else:
+            for row in learnings:
+                with st.container(border=True):
+                    st.write(f"**Acción:** {row.get('insight_id', '-')}")
+                    st.write(f"**Resultado:** {row.get('outcome', 'unknown')}")
+                    if row.get("primary_metric_label"):
+                        st.caption(f"Métrica principal: {row.get('primary_metric_label')}")
+                    if row.get("learning_note"):
+                        st.write(f"**Qué aprendimos:** {row.get('learning_note')}")
+                    st.caption(
+                        f"Periodo: {row.get('period', '-')} · Revisado: {row.get('reviewed_at') or row.get('updated_at') or '-'}"
                     )
 
     # Seguimiento
@@ -855,8 +893,10 @@ with tab_owner:
                         "insight_id": it.get("insight_id", "-"),
                         "estado": it.get("status", "planned"),
                         "resultado": it.get("outcome", "unknown"),
+                        "métrica_principal": it.get("primary_metric_label", ""),
                         "actualizado": it.get("updated_at", "-"),
                         "nota": it.get("note", ""),
+                        "aprendizaje": it.get("learning_note", ""),
                     }
                     for it in items
                 ]
@@ -971,19 +1011,35 @@ with tab_admin:
         st.divider()
         st.markdown("## Admin · Recomendaciones activadas")
         st.caption("Vista completa del motor actual")
+
         try:
-            for card in rescored_cards[:15]:
+            for rec_result in recommendation_plan.all_cards[:15]:
+                card = rec_result.card
                 low, high = card.estimated_impact_eur
+
                 st.markdown(f"**💡 {card.title}**")
                 st.caption(
                     f"Impacto ({horizonte}): {eur(low)} – {eur(high)} · "
                     f"Esfuerzo: {card.effort} · Tiempo: {card.time_to_apply_min} min"
                 )
                 st.write(f"**Por qué aparece ahora:** {card.why_now}")
-                st.write(f"**Qué podrías probar:** {card.action}")
+                st.write(f"**Qué probar:** {card.action}")
+                st.write(f"**Hipótesis:** {card.hypothesis}")
+                st.write(f"**Dónde aplicarlo:** {card.where_to_apply}")
+                st.write(f"**Qué mediremos:** {card.primary_metric_label}")
+                if card.secondary_metric_labels:
+                    st.write("**Métricas secundarias:** " + ", ".join(card.secondary_metric_labels))
+                st.write(f"**Éxito esperado:** {card.success_rule_text}")
                 st.write(f"**Si ya lo haces:** {card.if_already_doing}")
                 st.write(f"**Estrategia sugerida:** {card.strategy}")
-                st.caption(f"Peso actual: {card.priority_weight:.2f} | tags={', '.join(card.tags)}")
+                st.caption(
+                    f"Peso base: {card.priority_weight:.2f} · "
+                    f"Score final: {rec_result.score:.2f} · "
+                    f"Prioridad: {card.priority_label} · "
+                    f"Confianza: {card.confidence_label} · "
+                    f"tags={', '.join(card.tags)}"
+                )
+                st.caption(f"Razón ranking: {rec_result.reason}")
                 st.divider()
         except Exception:
             st.info("Las recomendaciones se muestran cuando se genera el Owner.")

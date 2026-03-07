@@ -1,51 +1,108 @@
-# app/analytics/ranking.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Iterable, Optional
 
-from .insights import Insight
 from .history_store import HistoryStore
+from .recommendation_library import RecommendationCard
 
 
+# ============================================================
+# Modelo principal
+# ============================================================
 @dataclass(frozen=True)
-class ScoredInsight:
-    insight: Insight
+class ScoredRecommendation:
+    """
+    Recomendación puntuada y lista para selección final.
+    """
+
+    card: RecommendationCard
     score: float
     reason: str
 
 
-def _impact_mid(ins: Insight) -> float:
-    low, high = ins.estimated_impact_eur
+# ============================================================
+# Helpers de score base
+# ============================================================
+def _impact_mid(card: RecommendationCard) -> float:
+    low, high = card.estimated_impact_eur
     return 0.5 * (float(low) + float(high))
 
 
 def _effort_penalty(effort: str) -> float:
-    """Penaliza acciones con más esfuerzo para priorizar quick wins."""
+    """
+    Penaliza acciones con más fricción operativa.
+    """
     e = (effort or "").strip().lower()
-    return {"baja": 0.0, "media": 0.15, "alta": 0.35}.get(e, 0.2)
+    return {
+        "bajo": 0.00,
+        "media": 0.12,
+        "medio": 0.12,
+        "alta": 0.28,
+    }.get(e, 0.15)
 
 
 def _time_penalty(minutes: int) -> float:
-    """Penalización suave por tiempo (0..0.30)."""
+    """
+    Penalización suave por tiempo estimado de aplicación.
+    """
     try:
         m = int(minutes)
     except Exception:
-        m = 60
-    return min(0.30, max(0.0, m / 240.0))
+        m = 30
+    return min(0.25, max(0.0, m / 240.0))
 
 
-# ----------------------------
+def _confidence_bonus(confidence_label: str) -> float:
+    c = (confidence_label or "").strip().lower()
+    return {
+        "alta": 0.10,
+        "media": 0.04,
+        "baja": -0.04,
+    }.get(c, 0.0)
+
+
+def _priority_editorial_bonus(priority_weight: float) -> float:
+    """
+    Bonus suave por prioridad editorial/base del catálogo.
+    """
+    return max(0.0, min(0.20, (float(priority_weight) - 0.70)))
+
+
+def _quick_win_bonus(card: RecommendationCard) -> float:
+    """
+    Bonus ligero para acciones fáciles de vender y aplicar.
+    """
+    bonus = 0.0
+
+    effort = (card.effort or "").strip().lower()
+    if effort == "bajo":
+        bonus += 0.03
+
+    try:
+        mins = int(card.time_to_apply_min)
+    except Exception:
+        mins = 30
+
+    if mins <= 15:
+        bonus += 0.03
+    elif mins <= 30:
+        bonus += 0.01
+
+    if (card.confidence_label or "").strip().lower() == "alta":
+        bonus += 0.02
+
+    return min(0.08, bonus)
+
+
+# ============================================================
 # History helpers
-# ----------------------------
+# ============================================================
 def _iter_history_items(hist: dict) -> list[dict]:
     """
     Devuelve lista plana de items históricos.
-    Soporta:
-      A) hist["periods"][period_key]["items"]
-      B) hist["recommendations"][...]["items"] (v1)
-      C) hist[period_key]["items"] (legacy raro)
+    Soporta varias formas de guardado.
     """
     if not hist or not isinstance(hist, dict):
         return []
@@ -60,9 +117,9 @@ def _iter_history_items(hist: dict) -> list[dict]:
                 if isinstance(items, list):
                     for it in items:
                         if isinstance(it, dict):
-                            it2 = dict(it)
-                            it2.setdefault("period_key", pk)
-                            out.append(it2)
+                            row = dict(it)
+                            row.setdefault("period_key", pk)
+                            out.append(row)
 
     recs = hist.get("recommendations")
     if isinstance(recs, list):
@@ -72,9 +129,9 @@ def _iter_history_items(hist: dict) -> list[dict]:
                 if isinstance(items, list):
                     for it in items:
                         if isinstance(it, dict):
-                            it2 = dict(it)
-                            it2.setdefault("period_key", r.get("period"))
-                            out.append(it2)
+                            row = dict(it)
+                            row.setdefault("period_key", r.get("period"))
+                            out.append(row)
 
     for k, v in hist.items():
         if k in ("periods", "recommendations"):
@@ -82,15 +139,14 @@ def _iter_history_items(hist: dict) -> list[dict]:
         if isinstance(v, dict) and isinstance(v.get("items"), list):
             for it in v["items"]:
                 if isinstance(it, dict):
-                    it2 = dict(it)
-                    it2.setdefault("period_key", k)
-                    out.append(it2)
+                    row = dict(it)
+                    row.setdefault("period_key", k)
+                    out.append(row)
 
     return out
 
 
 def _parse_iso(dt_str: str) -> Optional[datetime]:
-    """Parse seguro del ISO que tú guardas (YYYY-MM-DDTHH:MM:SS)."""
     try:
         return datetime.fromisoformat(str(dt_str))
     except Exception:
@@ -98,31 +154,30 @@ def _parse_iso(dt_str: str) -> Optional[datetime]:
 
 
 def _last_seen_item(items: list[dict], insight_id: str) -> Optional[dict]:
-    """Devuelve el item más reciente por updated_at."""
     seen = [it for it in items if it.get("insight_id") == insight_id]
     if not seen:
         return None
 
     def key(it: dict):
         dt = _parse_iso(it.get("updated_at") or it.get("generated_at") or "")
-        # si no parsea, lo mandamos al pasado
         return dt or datetime(1970, 1, 1)
 
     seen.sort(key=key)
     return seen[-1]
 
 
-def _feedback_adjustment(
+def _history_adjustment(
     hist: dict | None,
     insight_id: str,
     *,
     recency_days: int = 45,
 ) -> tuple[float, str]:
     """
-    Ajuste por historial (con recencia):
-      - penaliza repetición reciente si estaba planned/done
-      - recompensa improved, castiga not_improved
-      - castiga skipped
+    Ajuste por historial reciente:
+    - penaliza repetición reciente
+    - recompensa improved/positive
+    - castiga not_improved/negative
+    - castiga skip
     """
     if not hist:
         return 0.0, "sin_historial"
@@ -133,59 +188,124 @@ def _feedback_adjustment(
 
     last = _last_seen_item(items, insight_id)
     if not last:
-        return 0.0, "no_recomendado_antes"
+        return 0.0, "no_recomendada_antes"
 
-    status = (last.get("status") or "").strip().lower()
-    outcome = (last.get("outcome") or "").strip().lower()
+    status = str(last.get("status") or "").strip().lower()
+    outcome = str(last.get("outcome") or "").strip().lower()
 
     last_dt = _parse_iso(last.get("updated_at") or "") or datetime(1970, 1, 1)
     is_recent = last_dt >= (datetime.now() - timedelta(days=int(recency_days)))
 
-    # Penaliza repetición SOLO si es reciente
-    rep_penalty = (-0.20 if is_recent and status in ("planned", "done") else 0.0)
+    adj = 0.0
+    reasons: list[str] = []
 
-    if outcome == "improved":
-        return rep_penalty + 0.25, f"feedback:improved(recent={is_recent})"
-    if outcome == "not_improved":
-        return rep_penalty - 0.25, f"feedback:not_improved(recent={is_recent})"
-    if status == "skipped":
-        return rep_penalty - 0.10, f"feedback:skipped(recent={is_recent})"
-    return rep_penalty, f"feedback:unknown(recent={is_recent})"
+    # Penalización ligera por repetición reciente
+    if is_recent and status in ("planned", "done", "active"):
+        adj -= 0.12
+        reasons.append("repeticion_reciente")
+
+    # already_doing penaliza menos: indica que la idea no es nueva,
+    # pero no necesariamente que sea mala o irrelevante
+    if is_recent and status == "already_doing":
+        adj -= 0.06
+        reasons.append("ya_lo_hacen")
+
+    if outcome in ("improved", "positivo", "positive"):
+        adj += 0.16
+        reasons.append("resultado_positivo")
+    elif outcome in ("not_improved", "negative", "negativo"):
+        adj -= 0.18
+        reasons.append("resultado_negativo")
+    elif outcome in ("inconclusive", "inconcluso"):
+        adj -= 0.05
+        reasons.append("resultado_inconcluso")
+    elif outcome in ("neutral", "neutro"):
+        adj -= 0.02
+        reasons.append("resultado_neutro")
+
+    if status in ("skipped", "saltado", "saltar"):
+        adj -= 0.08
+        reasons.append("saltada")
+
+    if not reasons:
+        reasons.append("sin_senal_fuerte")
+
+    return adj, f"{'+' if adj >= 0 else ''}{adj:.2f}|" + ",".join(reasons)
 
 
-def rank_insights(
-    candidates: list[Insight],
-    history_store: HistoryStore,
-    period_key: str,
+# ============================================================
+# Score principal
+# ============================================================
+def score_recommendations(
+    candidates: Iterable[RecommendationCard],
+    history_store: HistoryStore | None = None,
     *,
     recency_days: int = 45,
-) -> list[ScoredInsight]:
+) -> list[ScoredRecommendation]:
     """
-    Ranking transparente:
-      - impacto normalizado (mid) solo en revenue
-      - penalizaciones: esfuerzo + tiempo
-      - ajuste por historial (recencia/outcome)
+    Scoring comercial orientado a RecommendationCard.
+
+    Componentes:
+    - impacto normalizado
+    - bonus por prioridad editorial
+    - bonus por confianza
+    - bonus quick win
+    - penalización por esfuerzo
+    - penalización por tiempo
+    - ajuste por histórico
     """
-    hist = history_store.load()
+    cards = list(candidates)
+    if not cards:
+        return []
 
-    revenue_mids = [_impact_mid(x) for x in candidates if getattr(x, "impact_type", "") == "revenue"]
-    max_mid = max(revenue_mids) if revenue_mids else 1.0
+    hist = history_store.load() if history_store is not None else {}
 
-    scored: list[ScoredInsight] = []
-    for ins in candidates:
-        mid = _impact_mid(ins)
+    mids = [_impact_mid(c) for c in cards]
+    max_mid = max(mids) if mids else 1.0
+    if max_mid <= 0:
+        max_mid = 1.0
+
+    scored: list[ScoredRecommendation] = []
+
+    for card in cards:
+        mid = _impact_mid(card)
         impact_norm = (mid / max_mid) if max_mid else 0.0
 
-        base = 0.70 * impact_norm if ins.impact_type == "revenue" else 0.10
-        pen = _effort_penalty(ins.effort) + _time_penalty(ins.time_to_apply_min)
-        adj, adj_reason = _feedback_adjustment(hist, ins.insight_id, recency_days=recency_days)
+        impact_component = 0.45 * impact_norm
+        editorial_component = _priority_editorial_bonus(card.priority_weight)
+        confidence_component = _confidence_bonus(card.confidence_label)
+        quick_win_component = _quick_win_bonus(card)
+        effort_component = _effort_penalty(card.effort)
+        time_component = _time_penalty(card.time_to_apply_min)
+        hist_adj, hist_reason = _history_adjustment(
+            hist,
+            card.insight_id,
+            recency_days=recency_days,
+        )
 
-        score = base - pen + adj
-        reason = f"impact={impact_norm:.2f} base={base:.2f} pen={pen:.2f} adj={adj:.2f} ({adj_reason})"
+        score = (
+            impact_component
+            + editorial_component
+            + confidence_component
+            + quick_win_component
+            - effort_component
+            - time_component
+            + hist_adj
+        )
+
+        reason = (
+            f"impact={impact_norm:.2f} "
+            f"editorial={editorial_component:.2f} "
+            f"confidence={confidence_component:.2f} "
+            f"quickwin={quick_win_component:.2f} "
+            f"effort=-{effort_component:.2f} "
+            f"time=-{time_component:.2f} "
+            f"history={hist_reason}"
+        )
 
         scored.append(
-            ScoredInsight(
-                insight=ins,
+            ScoredRecommendation(
+                card=card,
                 score=round(float(score), 4),
                 reason=reason,
             )
@@ -195,48 +315,60 @@ def rank_insights(
     return scored
 
 
-def select_plan(
-    scored: list[ScoredInsight],
-    k: int = 3,
-    *,
-    require_revenue_for_owner: bool = True,
-) -> list[ScoredInsight]:
+# ============================================================
+# Selección final para Owner/Admin
+# ============================================================
+def _same_family(a: RecommendationCard, b: RecommendationCard) -> bool:
     """
-    Selección Top-k con diversidad por kpi_target.
-    - Evita 3 acciones con el mismo KPI.
-    - Owner: prioriza revenue (si require_revenue_for_owner=True).
+    Evita meter recomendaciones demasiado parecidas.
+    Criterio:
+    - mismo goal y al menos 1 tag compartido
+    - o 2+ tags compartidos
+    """
+    shared_tags = set(a.tags).intersection(set(b.tags))
+
+    if a.goal == b.goal and len(shared_tags) >= 1:
+        return True
+
+    return len(shared_tags) >= 2
+
+
+def select_plan(
+    scored: list[ScoredRecommendation],
+    k: int = 3,
+) -> list[ScoredRecommendation]:
+    """
+    Selección Top-k con diversidad pragmática:
+    - prioriza score
+    - evita clones temáticos
+    - rellena si hace falta
     """
     k = max(0, int(k))
     if k == 0:
         return []
 
-    pool = scored[:]
+    picked: list[ScoredRecommendation] = []
 
-    # Owner: prioriza revenue
-    if require_revenue_for_owner:
-        revenue = [s for s in pool if getattr(s.insight, "impact_type", "") == "revenue"]
-        nonrev = [s for s in pool if getattr(s.insight, "impact_type", "") != "revenue"]
-        pool = revenue + nonrev  # mantiene orden relativo
-
-    picked: list[ScoredInsight] = []
-    used_kpis: set[str] = set()
-
-    for s in pool:
-        kpi = str(getattr(s.insight, "kpi_target", "") or "")
-        if kpi and kpi in used_kpis:
+    for item in scored:
+        if not picked:
+            picked.append(item)
+            if len(picked) >= k:
+                return picked
             continue
-        picked.append(s)
-        if kpi:
-            used_kpis.add(kpi)
-        if len(picked) >= k:
-            break
 
-    # Si no llegamos a k por diversidad, rellenamos sin restricción
+        is_too_similar = any(_same_family(item.card, prev.card) for prev in picked)
+        if is_too_similar:
+            continue
+
+        picked.append(item)
+        if len(picked) >= k:
+            return picked
+
     if len(picked) < k:
-        for s in pool:
-            if s in picked:
+        for item in scored:
+            if item in picked:
                 continue
-            picked.append(s)
+            picked.append(item)
             if len(picked) >= k:
                 break
 

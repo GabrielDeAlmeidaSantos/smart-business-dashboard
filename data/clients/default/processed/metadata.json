@@ -1,0 +1,92 @@
+{
+  "input": {
+    "path": "data\\clients\\default\\input\\upload_20260307_171624.xlsx",
+    "kind": ".xlsx",
+    "sheet_used": "Sheet1",
+    "csv_sep": null,
+    "csv_encoding": null
+  },
+  "rows_raw": 4436,
+  "rows_norm": 4436,
+  "rows_clean": 4436,
+  "mapping": {
+    "mapping_detected": {
+      "Fecha de venta": "fecha",
+      "Servicio": "producto",
+      "Unidades": "cantidad",
+      "Precio unitario": "precio_unitario"
+    },
+    "mapping_reverse": {
+      "fecha": "Fecha de venta",
+      "producto": "Servicio",
+      "cantidad": "Unidades",
+      "precio_unitario": "Precio unitario"
+    },
+    "mapping_collisions": {},
+    "original_columns": [
+      "Fecha de venta",
+      "Servicio",
+      "Unidades",
+      "Precio unitario"
+    ],
+    "normalized_columns": [
+      "fecha",
+      "producto",
+      "cantidad",
+      "precio_unitario",
+      "importe_total",
+      "ticket_id"
+    ]
+  },
+  "stats": {
+    "rows_in": 4436,
+    "rows_dropped_all_nan": 0,
+    "rows_dropped_na_core": 0,
+    "rows_dropped_rules": 0,
+    "price_mode": "unit_price",
+    "revenue_source": "precio_unitario*cantidad",
+    "allow_negative_revenue": false,
+    "placeholders_producto": 0,
+    "sanity": {
+      "cantidad": {
+        "min": 1.0,
+        "p05": 1.0,
+        "p50": 1.0,
+        "p95": 1.0,
+        "max": 2.0
+      },
+      "precio_unitario": {
+        "min": 9.9,
+        "p05": 10.95,
+        "p50": 29.645,
+        "p95": 44.86,
+        "max": 61.57
+      },
+      "importe_total": {
+        "min": null,
+        "p05": null,
+        "p50": null,
+        "p95": null,
+        "max": null
+      },
+      "revenue": {
+        "min": 9.9,
+        "p05": 10.95,
+        "p50": 29.675,
+        "p95": 44.86,
+        "max": 61.57
+      }
+    }
+  },
+  "date_min": "2025-01-01 00:00:00",
+  "date_max": "2025-12-26 00:00:00",
+  "columns_out": [
+    "fecha",
+    "producto",
+    "cantidad",
+    "precio_unitario",
+    "importe_total",
+    "ticket_id",
+    "revenue"
+  ]
+}
