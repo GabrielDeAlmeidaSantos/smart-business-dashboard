@@ -1,4 +1,3 @@
-# app/streamlit_app.py
 from __future__ import annotations
 
 from datetime import datetime
@@ -18,9 +17,12 @@ from app.analytics.kpis import (
     build_serie_tiempo,
 )
 from app.analytics.profile import detect_business_profile
-from app.analytics.insights import generate_insights
 from app.analytics.history_store import HistoryStore
-from app.analytics.ranking import rank_insights, select_plan
+from app.analytics.recommendation_library import (
+    build_recommendation_cards,
+    apply_history_penalty,
+    select_top_cards,
+)
 
 # Pipeline (para uploader)
 from src.pipeline import PipelinePaths, run_pipeline
@@ -51,12 +53,13 @@ def load_metadata(path: str) -> dict:
 # Auth (simple)
 # ----------------------------
 def is_authorized(client_id: str, code: str) -> bool:
-    """Authorize write-access using secrets per client_id."""
+    """Permite acceso de escritura usando secrets por client_id."""
     try:
         expected = st.secrets["clients"][client_id]
         return str(code).strip() == str(expected).strip()
     except Exception:
         return False
+
 
 
 def available_client_ids() -> list[str]:
@@ -107,6 +110,7 @@ def fig_ingresos_tiempo(serie: pd.DataFrame, agrupacion: str):
     return fig
 
 
+
 def fig_top_servicios(df_f: pd.DataFrame, top_n: int):
     """Figura: top productos/servicios por ingresos + tabla top."""
     top = (
@@ -137,6 +141,7 @@ def fig_top_servicios(df_f: pd.DataFrame, top_n: int):
     return fig, top
 
 
+
 def fig_ingresos_dia_semana(ingresos_dia: pd.DataFrame):
     """Figura: ingresos por día de semana."""
     ingresos_dia = ingresos_dia.copy()
@@ -155,6 +160,109 @@ def fig_ingresos_dia_semana(ingresos_dia: pd.DataFrame):
     fig.update_yaxes(title_text="Ingresos (€)")
     fig.update_xaxes(title_text="Día")
     return fig
+
+
+# ----------------------------
+# Text helpers (Owner)
+# ----------------------------
+def build_owner_summary(
+    kpis_act,
+    kpis_prev,
+    peor_dia: dict,
+    mejor_dia: dict,
+    top_item: str,
+) -> list[str]:
+    """
+    Genera frases simples para que el owner entienda rápido
+    qué está pasando y dónde conviene actuar primero.
+    """
+    frases: list[str] = []
+
+    if kpis_prev.ingresos > 0:
+        delta_pct = ((kpis_act.ingresos - kpis_prev.ingresos) / kpis_prev.ingresos) * 100
+        if delta_pct >= 5:
+            frases.append(
+                f"Tus ingresos van mejor que en el periodo anterior: suben un {delta_pct:.1f}%."
+            )
+        elif delta_pct <= -5:
+            frases.append(
+                f"Tus ingresos van peor que en el periodo anterior: bajan un {abs(delta_pct):.1f}%."
+            )
+        else:
+            frases.append(
+                "Tus ingresos están bastante estables frente al periodo anterior."
+            )
+    else:
+        frases.append(
+            "No hay suficiente histórico anterior para comparar bien la evolución del negocio."
+        )
+
+    frases.append(
+        f"Tu día más flojo es {peor_dia['dia_nombre']} y tu mejor día es {mejor_dia['dia_nombre']}."
+    )
+
+    frases.append(
+        f"Ahora mismo la mejora más clara está en vender mejor en el día flojo, apoyándote en referencias como {top_item} sin depender de descuentos."
+    )
+
+    return frases
+
+
+
+def build_history_summary(history: HistoryStore, period_key: str) -> dict:
+    """
+    Resume el histórico del periodo para favorecer rotación.
+    """
+    period_data = history.get_period(period_key) or {}
+    items = period_data.get("items") or []
+
+    recent_done: list[str] = []
+    recent_seen: list[str] = []
+    already_doing: list[str] = []
+
+    for it in items:
+        insight_id = str(it.get("insight_id", "")).strip()
+        if not insight_id:
+            continue
+
+        recent_seen.append(insight_id)
+
+        status = str(it.get("status", "")).strip().lower()
+        outcome = str(it.get("outcome", "")).strip().lower()
+
+        if status == "done":
+            recent_done.append(insight_id)
+
+        if outcome == "already_doing":
+            already_doing.append(insight_id)
+
+    return {
+        "recent_done": list(set(recent_done)),
+        "recent_seen": list(set(recent_seen)),
+        "already_doing": list(set(already_doing)),
+    }
+
+
+
+def top_item_share_pct(top_df: pd.DataFrame, df_f: pd.DataFrame) -> float:
+    """Peso porcentual del top 1 sobre ingresos totales."""
+    if top_df.empty or df_f.empty:
+        return 0.0
+    total = float(df_f["revenue"].sum()) if not df_f.empty else 0.0
+    if total <= 0:
+        return 0.0
+    top_value = float(top_df.iloc[0]["ingresos"])
+    return (top_value / total) * 100.0
+
+
+
+def owner_metric_labels(granularity: str) -> tuple[str, str]:
+    """
+    Etiquetas más entendibles para Owner.
+    """
+    if granularity == "ticket":
+        return ("Tickets", "Importe medio por ticket")
+    return ("Operaciones registradas", "Importe medio por operación (aprox.)")
 
 
 # ----------------------------
@@ -187,20 +295,20 @@ with st.sidebar:
 
     # Auth
     access_code = st.text_input(
-        "Código de acceso",
+        "Código del negocio",
         type="password",
-        help="Habilita guardado de plan y seguimiento.",
+        help="Activa guardado de plan y seguimiento para este negocio.",
     )
     authorized = is_authorized(client_id, access_code)
 
     autoguardar = st.toggle(
         "Autoguardar plan del periodo",
         value=True,
-        help="Guarda el plan automáticamente si aún no existe para este periodo. No machaca seguimiento.",
+        help="Guarda el plan automáticamente si aún no existe para este periodo. No sobrescribe el seguimiento.",
     )
 
     if not authorized:
-        st.info("Sin código: puedes ver el dashboard, pero NO se guarda seguimiento.")
+        st.info("Sin código: puedes ver el dashboard, pero no se guarda seguimiento.")
 
     st.divider()
 
@@ -222,7 +330,6 @@ with st.sidebar:
             accept_multiple_files=False,
         )
 
-        # Procesar
         if uploaded is not None:
             ext = Path(uploaded.name).suffix.lower()
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -236,7 +343,6 @@ with st.sidebar:
             if st.button("Procesar ahora", use_container_width=True):
                 try:
                     paths = PipelinePaths.for_client(client_id)
-                    # Forzamos input_file al último upload guardado
                     paths = PipelinePaths(
                         input_dir=paths.input_dir,
                         processed_dir=paths.processed_dir,
@@ -249,7 +355,7 @@ with st.sidebar:
                     )
                     run_pipeline(paths)
                     st.cache_data.clear()
-                    st.success("Procesado ✅ (cache limpiada).")
+                    st.success("Procesado correctamente ✅")
                 except Exception as e:
                     st.error(f"Error procesando: {e}")
 
@@ -258,7 +364,7 @@ with st.sidebar:
         st.subheader("Admin")
         st.caption("Si prefieres consola:")
         st.code("python src/pipeline.py", language="bash")
-        st.caption("⚠️ Recuerda: sin ticket_id, métricas de ticket son aproximadas.")
+        st.caption("Aviso: si no hay ticket_id, las métricas de ticket son aproximadas.")
 
 
 # ----------------------------
@@ -279,7 +385,7 @@ if not RUTA_DATOS.exists():
     msg = (
         "No hay datos procesados todavía.\n\n"
         "- Modo Cliente: sube archivo y pulsa **Procesar ahora**.\n"
-        "- Modo Global: ejecuta `python src/pipeline.py`."
+        "- Modo Demo: usa la fuente Global (demo) para ver un ejemplo."
     )
     st.warning(msg)
     st.stop()
@@ -300,7 +406,6 @@ st.caption(
     f"  |  Registros: {len(df):,}".replace(",", ".")
 )
 
-# Metadata (para warnings y admin)
 meta = load_metadata(str(RUTA_META)) if RUTA_META.exists() else {}
 
 
@@ -363,7 +468,7 @@ delta_uni = kpis_act.unidades - kpis_prev.unidades
 
 
 # ----------------------------
-# Perfil detectado
+# Perfil detectado (solo para lógica interna)
 # ----------------------------
 profile = detect_business_profile(df_f)
 
@@ -377,45 +482,82 @@ mejor_dia = info_dias["mejor"]
 gap = info_dias["gap"]
 ventas_peor_raw = int(info_dias["ventas_peor"])
 
-# Modo conservador si NO hay ticket_id (granularity row)
+# Modo conservador si NO hay ticket_id
 conservative_factor = 1.0 if info_dias.get("granularity") == "ticket" else 0.5
 ventas_peor = int(max(1, round(ventas_peor_raw * conservative_factor)))
+
+# Top para textos e insights
+fig_top, top_df = fig_top_servicios(df_f, int(top_n))
+top_item = top_df.iloc[0]["producto"] if not top_df.empty else "tu servicio principal"
 
 
 # ----------------------------
 # Owner tab
 # ----------------------------
 with tab_owner:
-    # Calidad de datos (rápido y útil)
-    if meta:
-        stats = meta.get("stats") or {}
-        placeholders = int(stats.get("placeholders_producto", 0) or 0)
-        collisions = (meta.get("mapping") or {}).get("mapping_collisions") or {}
-        cQ1, cQ2, cQ3 = st.columns(3)
-        with cQ1:
-            st.metric("Fuente revenue", str(stats.get("revenue_source", "-")))
-        with cQ2:
-            st.metric("Placeholders producto", f"{placeholders}")
-        with cQ3:
-            st.metric("Colisiones mapping", f"{len(collisions) if isinstance(collisions, dict) else 0}")
+    # Resumen ejecutivo
+    st.markdown("## Qué está pasando en el negocio")
+    st.caption(
+        "Lectura rápida del periodo para entender dónde estás y qué conviene mover primero."
+    )
+    owner_summary = build_owner_summary(
+        kpis_act=kpis_act,
+        kpis_prev=kpis_prev,
+        peor_dia=peor_dia,
+        mejor_dia=mejor_dia,
+        top_item=top_item,
+    )
+    for frase in owner_summary:
+        st.write(f"- {frase}")
 
-    st.markdown("## Perfil detectado")
-    p1, p2 = st.columns([3, 1])
-    with p1:
-        st.write(f"**Tipo:** {profile.business_type} | **Subtipo:** {profile.subtype}")
-        st.caption("Evidencia: " + " | ".join(profile.evidence))
-    with p2:
-        st.metric("Confianza", f"{int(profile.confidence * 100)}%")
+    if meta:
+        calidad_lectura = "alta" if info_dias.get("granularity") == "ticket" else "media"
+        st.caption(
+            f"Lectura del periodo: {calidad_lectura}. Las estimaciones se ajustan al detalle disponible."
+        )
 
     st.divider()
 
-    st.markdown("## Oportunidad detectada")
-    st.caption("Estimación conservadora: no asume subir precios; asume vender un extra/pack.")
+    # KPIs primero: contexto antes de recomendar acciones
+    st.markdown("## Resumen del periodo")
+    st.caption("Comparado con el periodo anterior de la misma duración.")
+
+    ops_label, avg_label = owner_metric_labels(info_dias.get("granularity", "row"))
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(
+        "Ingresos",
+        eur(kpis_act.ingresos),
+        delta=f"{eur(delta_ing)} ({pct_str(delta_ing, kpis_prev.ingresos)})" if kpis_prev.ingresos else None,
+    )
+    k2.metric(
+        ops_label,
+        f"{kpis_act.ventas}",
+        delta=f"{delta_ven} ({pct_str(delta_ven, kpis_prev.ventas)})" if kpis_prev.ventas else None,
+    )
+    k3.metric(
+        avg_label,
+        eur(kpis_act.ticket),
+        delta=f"{eur(delta_tic)} ({pct_str(delta_tic, kpis_prev.ticket)})" if kpis_prev.ticket else None,
+    )
+    k4.metric(
+        "Unidades",
+        f"{int(kpis_act.unidades)}",
+        delta=f"{int(delta_uni)} ({pct_str(delta_uni, kpis_prev.unidades)})" if kpis_prev.unidades else None,
+    )
+
+    st.divider()
+
+    # Oportunidad principal
+    st.markdown("## La oportunidad más clara ahora")
+    st.caption(
+        "Esta es la mejora con más potencial según los datos actuales, sin depender de descuentos."
+    )
 
     cS1, cS2 = st.columns([2, 1])
     with cS1:
         subida_eur = st.slider(
-            f"Mejora de {kpis_act.ticket_label} en el día flojo (€)",
+            f"Mejora de {avg_label} en el día flojo (€)",
             min_value=0,
             max_value=10,
             value=3,
@@ -423,7 +565,7 @@ with tab_owner:
         )
     with cS2:
         horizonte = st.selectbox(
-            "Horizonte (basado en el rango)",
+            "Horizonte de referencia",
             ["1× rango", "3× rango", "12× rango"],
             index=1,
         )
@@ -439,62 +581,72 @@ with tab_owner:
 
     hero1, hero2, hero3 = st.columns([2, 1, 1])
     with hero1:
-        st.metric("Escenario base (estimación)", eur(impacto_horizonte))
+        st.metric("Impacto orientativo", eur(impacto_horizonte))
         gran = info_dias.get("granularity", "row")
         if gran != "ticket":
-            st.caption("⚠️ Sin ticket_id: usamos modo conservador (×0.5) para no inflar.")
+            st.caption("Estimación ajustada de forma prudente al nivel de detalle disponible.")
         st.caption(
             f"Rango: {inicio.date().isoformat()} → {(fin - pd.Timedelta(days=1)).date().isoformat()} "
             f"({days_in_range} días) | Día flojo: **{peor_dia['dia_nombre']}** | "
-            f"Base: {ventas_peor_raw} {('tickets' if gran=='ticket' else 'líneas')} (ajustado a {ventas_peor})."
+            f"Base de cálculo: {ventas_peor_raw} {('tickets' if gran == 'ticket' else 'registros')} (ajustado a {ventas_peor})."
         )
     with hero2:
-        st.metric("Base en el rango", eur(impacto_rango))
-        st.caption(f"Horizonte: **{horizonte}**")
+        st.metric("Impacto en este periodo", eur(impacto_rango))
+        st.caption(f"Referencia usada: **{horizonte}**")
     with hero3:
-        st.metric("Equivalente €/día (rango)", eur(impacto_por_dia))
-        with st.expander("Ver anualizado (referencia)", expanded=False):
+        st.metric("Promedio diario", eur(impacto_por_dia))
+        with st.expander("Ver anualizado (solo referencia)", expanded=False):
             st.metric("Anualizado", eur(impacto_anualizado))
 
     st.info(
-        f"Si el **{peor_dia['dia_nombre']}** sube {kpis_act.ticket_label} **+{subida_eur}€**, "
-        f"impacto estimado: **{eur(impacto_horizonte)}** (horizonte **{horizonte}**)."
+        f"Si el **{peor_dia['dia_nombre']}** mejora **+{subida_eur} €** por operación, "
+        f"el impacto orientativo sería **{eur(impacto_horizonte)}** usando como referencia **{horizonte}**."
     )
 
     st.divider()
 
-    # Top para textos e insights
-    fig_top, top_df = fig_top_servicios(df_f, int(top_n))
-    top_item = top_df.iloc[0]["producto"] if not top_df.empty else "tu servicio principal"
-
-    candidates = generate_insights(
-        df_range=df_f,
-        kpis=kpis_act,
-        profile_type=profile.business_type,
-        profile_subtype=profile.subtype,
-        peor_dia_nombre=peor_dia["dia_nombre"],
-        mejor_dia_nombre=mejor_dia["dia_nombre"],
-        gap_dias_eur=float(gap),
-        ventas_peor_dia=int(ventas_peor),
-        top_item=top_item,
-        slider_subida_ticket_eur=float(subida_eur),
-        horizon_multiplier=int(h_mult),
-        horizon_label=str(horizonte),
-    )
-
-    # History (solo lectura/uso si autorizado)
+    # Recomendaciones del motor nuevo
     history_path = Path("data/clients") / client_id / "history.json"
     history_path.parent.mkdir(parents=True, exist_ok=True)
     history = HistoryStore(client_id=client_id, path=history_path)
 
-    ranked = rank_insights(candidates, history, period_key=period_key)
-    plan = select_plan(ranked, k=3, require_revenue_for_owner=True)
+    delta_ing_pct = 0.0
+    if kpis_prev.ingresos and float(kpis_prev.ingresos) != 0.0:
+        delta_ing_pct = (
+            (float(kpis_act.ingresos) - float(kpis_prev.ingresos)) / float(kpis_prev.ingresos)
+        ) * 100.0
 
-    # Autoguardar plan si autorizado
+    gran = info_dias.get("granularity", "row")
+    granularity_label = "alta" if gran == "ticket" else "media"
+    top_share_pct = top_item_share_pct(top_df, df_f)
+
+    recommendation_ctx = {
+        "worst_day": peor_dia["dia_nombre"],
+        "best_day": mejor_dia["dia_nombre"],
+        "worst_day_gap_eur": float(gap),
+        "ventas_peor_dia": int(ventas_peor),
+        "top_item": top_item,
+        "slider_subida_ticket_eur": float(subida_eur),
+        "ticket_label": avg_label,
+        "delta_ing_pct": float(delta_ing_pct),
+        "top_share_pct": float(top_share_pct),
+        "granularity_label": granularity_label,
+    }
+
+    raw_cards = build_recommendation_cards(
+        ctx=recommendation_ctx,
+        business_type=profile.business_type,
+        subtype=profile.subtype,
+    )
+
+    history_summary = build_history_summary(history, period_key)
+    rescored_cards = apply_history_penalty(raw_cards, history_summary)
+    plan = select_top_cards(rescored_cards, k=3)
+
     if autoguardar and authorized and (history.get_period(period_key) is None):
         history.upsert_period_plan(
             period_key=period_key,
-            insight_ids=[x.insight.insight_id for x in plan],
+            insight_ids=[x.insight_id for x in plan],
             meta={
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
                 "business_type": profile.business_type,
@@ -504,11 +656,17 @@ with tab_owner:
             },
         )
 
-    # UX helpers
     def _need_auth_msg():
-        st.warning("Para guardar seguimiento, introduce el **código de acceso**.")
+        st.warning("Para guardar seguimiento, introduce el código del negocio.")
 
-    def _save_feedback(history_: HistoryStore, period_key_: str, insight_id_: str, status_: str, outcome_: str, note_: str):
+    def _save_feedback(
+        history_: HistoryStore,
+        period_key_: str,
+        insight_id_: str,
+        status_: str,
+        outcome_: str,
+        note_: str,
+    ):
         ok = history_.update_item(
             period_key=period_key_,
             insight_id=insight_id_,
@@ -521,49 +679,95 @@ with tab_owner:
             st.toast("Guardado ✅", icon="✅")
         return ok
 
-    def _render_action_card(s, horizonte_label: str, authorized_: bool, history_: HistoryStore | None, period_key_: str):
-        ins = s.insight
-        low, high = ins.estimated_impact_eur
+    def _render_action_card(
+        card,
+        horizonte_label: str,
+        authorized_: bool,
+        history_: HistoryStore | None,
+        period_key_: str,
+    ):
+        low, high = card.estimated_impact_eur
 
-        st.markdown(f"### {ins.title}")
+        st.markdown(f"### {card.title}")
         st.caption(
-            f"Impacto ({horizonte_label}): {eur(low)} – {eur(high)} · "
-            f"Esfuerzo: {ins.effort} · Tiempo: {ins.time_to_apply_min} min"
+            f"Impacto orientativo ({horizonte_label}): {eur(low)} – {eur(high)} · "
+            f"Esfuerzo: {card.effort} · Tiempo: {card.time_to_apply_min} min"
         )
-        st.write(f"**Acción:** {ins.action_hint}")
 
-        if modo_admin:
-            with st.expander("Ver evidencia / debug", expanded=False):
-                st.caption(f"Evidencia: {ins.evidence}")
-                st.caption(f"Motivo ranking: {s.reason} | score={s.score:.2f}")
+        st.write(f"**Por qué aparece ahora:** {card.why_now}")
+        st.write(f"**Qué podrías probar:** {card.action}")
 
-        c1, c2, c3 = st.columns(3)
-        done = c1.button("✅ Hecho", use_container_width=True, key=f"done_{period_key_}_{ins.insight_id}")
-        skip = c2.button("↩️ Saltar", use_container_width=True, key=f"skip_{period_key_}_{ins.insight_id}")
-        later = c3.button("🕒 Luego", use_container_width=True, key=f"later_{period_key_}_{ins.insight_id}")
+        with st.expander("Cómo aplicarlo", expanded=False):
+            st.write(f"**Si ya lo haces:** {card.if_already_doing}")
+            st.write(f"**Estrategia sugerida:** {card.strategy}")
+
+            c_info1, c_info2 = st.columns(2)
+            with c_info1:
+                st.caption(f"Objetivo: {card.goal}")
+            with c_info2:
+                st.caption("Priorizada según datos actuales e histórico reciente.")
+
+        # Botones en 2 filas para que no se rompa el layout
+        row1_col1, row1_col2 = st.columns(2)
+        done = row1_col1.button(
+            "✅ Hecho",
+            use_container_width=True,
+            key=f"done_{period_key_}_{card.insight_id}",
+        )
+        skip = row1_col2.button(
+            "↩️ Saltar",
+            use_container_width=True,
+            key=f"skip_{period_key_}_{card.insight_id}",
+        )
+
+        row2_col1, row2_col2 = st.columns(2)
+        later = row2_col1.button(
+            "🕒 Luego",
+            use_container_width=True,
+            key=f"later_{period_key_}_{card.insight_id}",
+        )
+        already = row2_col2.button(
+            "🔁 Ya lo hacemos",
+            use_container_width=True,
+            key=f"already_{period_key_}_{card.insight_id}",
+        )
 
         st.session_state.setdefault("fb", {})
-        key = f"{period_key_}:{ins.insight_id}"
+        key = f"{period_key_}:{card.insight_id}"
         st.session_state["fb"].setdefault(key, {"ask_outcome": False})
 
         if done:
             st.session_state["fb"][key]["ask_outcome"] = True
             if authorized_ and history_:
-                _save_feedback(history_, period_key_, ins.insight_id, "done", "unknown", "")
+                _save_feedback(history_, period_key_, card.insight_id, "done", "unknown", "")
             else:
                 _need_auth_msg()
 
         if skip:
             st.session_state["fb"][key]["ask_outcome"] = False
             if authorized_ and history_:
-                _save_feedback(history_, period_key_, ins.insight_id, "skipped", "unknown", "")
+                _save_feedback(history_, period_key_, card.insight_id, "skipped", "unknown", "")
             else:
                 _need_auth_msg()
 
         if later:
             st.session_state["fb"][key]["ask_outcome"] = False
             if authorized_ and history_:
-                _save_feedback(history_, period_key_, ins.insight_id, "planned", "unknown", "")
+                _save_feedback(history_, period_key_, card.insight_id, "planned", "unknown", "")
+            else:
+                _need_auth_msg()
+
+        if already:
+            st.session_state["fb"][key]["ask_outcome"] = False
+            if authorized_ and history_:
+                _save_feedback(
+                    history_,
+                    period_key_,
+                    card.insight_id,
+                    "done",
+                    "already_doing",
+                    "Ya lo hacen en el negocio",
+                )
             else:
                 _need_auth_msg()
 
@@ -571,14 +775,26 @@ with tab_owner:
             st.divider()
             st.markdown("**¿Mejoró algo?**")
             o1, o2, o3 = st.columns(3)
-            yes = o1.button("👍 Sí", use_container_width=True, key=f"out_yes_{period_key_}_{ins.insight_id}")
-            no = o2.button("👎 No", use_container_width=True, key=f"out_no_{period_key_}_{ins.insight_id}")
-            ns = o3.button("🤷 No sé", use_container_width=True, key=f"out_ns_{period_key_}_{ins.insight_id}")
+            yes = o1.button(
+                "👍 Sí",
+                use_container_width=True,
+                key=f"out_yes_{period_key_}_{card.insight_id}",
+            )
+            no = o2.button(
+                "👎 No",
+                use_container_width=True,
+                key=f"out_no_{period_key_}_{card.insight_id}",
+            )
+            ns = o3.button(
+                "🤷 No lo sé",
+                use_container_width=True,
+                key=f"out_ns_{period_key_}_{card.insight_id}",
+            )
 
             note = st.text_input(
                 "Nota (opcional)",
-                key=f"note_{period_key_}_{ins.insight_id}",
-                placeholder="Ej: extra A lo aceptaron 3/10...",
+                key=f"note_{period_key_}_{card.insight_id}",
+                placeholder="Ej: funcionó mejor por la tarde...",
             )
 
             chosen = None
@@ -592,78 +808,55 @@ with tab_owner:
             if chosen is not None:
                 st.session_state["fb"][key]["ask_outcome"] = False
                 if authorized_ and history_:
-                    _save_feedback(history_, period_key_, ins.insight_id, "done", chosen, note)
+                    _save_feedback(history_, period_key_, card.insight_id, "done", chosen, note)
                 else:
                     _need_auth_msg()
 
-    # Top 3 acciones
-    st.markdown("## Qué hago hoy (3 acciones)")
-    st.caption("Marca ✅ Hecho / ↩️ Saltar / 🕒 Luego.")
+    # Acciones del día
+    st.markdown("## Acciones recomendadas para hoy")
+    st.caption(
+        "Estas son las acciones más viables ahora por su relación entre impacto, esfuerzo y contexto del negocio."
+    )
 
     if not authorized:
-        st.caption("🔒 Para guardar progreso, activa acceso (opcional).")
+        st.caption("🔒 Si quieres guardar progreso, activa el acceso con el código del negocio.")
 
-    cA1, cA2, cA3 = st.columns(3)
-    for col, s in zip([cA1, cA2, cA3], plan):
-        with col:
-            with st.container(border=True):
-                _render_action_card(
-                    s=s,
-                    horizonte_label=str(horizonte),
-                    authorized_=authorized,
-                    history_=history if authorized else None,
-                    period_key_=period_key,
-                )
+    if not plan:
+        st.info("Todavía no hay recomendaciones activas para este periodo con las reglas actuales.")
+    else:
+        action_cols = st.columns(len(plan))
+        for col, card in zip(action_cols, plan):
+            with col:
+                with st.container(border=True):
+                    _render_action_card(
+                        card=card,
+                        horizonte_label=str(horizonte),
+                        authorized_=authorized,
+                        history_=history if authorized else None,
+                        period_key_=period_key,
+                    )
 
-    st.divider()
-
-    # Resumen KPIs (honesto)
-    st.markdown("## Contexto del rango (KPIs)")
-    st.caption("📌 Comparación con el periodo anterior de la misma duración.")
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric(
-        "Ingresos",
-        eur(kpis_act.ingresos),
-        delta=f"{eur(delta_ing)} ({pct_str(delta_ing, kpis_prev.ingresos)})" if kpis_prev.ingresos else None,
-    )
-    k2.metric(
-        kpis_act.ventas_label,
-        f"{kpis_act.ventas}",
-        delta=f"{delta_ven} ({pct_str(delta_ven, kpis_prev.ventas)})" if kpis_prev.ventas else None,
-    )
-    k3.metric(
-        kpis_act.ticket_label,
-        eur(kpis_act.ticket),
-        delta=f"{eur(delta_tic)} ({pct_str(delta_tic, kpis_prev.ticket)})" if kpis_prev.ticket else None,
-    )
-    k4.metric(
-        "Unidades",
-        f"{int(kpis_act.unidades)}",
-        delta=f"{int(delta_uni)} ({pct_str(delta_uni, kpis_prev.unidades)})" if kpis_prev.unidades else None,
-    )
-
-    # Seguimiento SOLO si autorizado
+    # Seguimiento
     if authorized:
         st.divider()
-        st.markdown("## Seguimiento")
-        st.caption("Acciones guardadas para este periodo (solo lectura).")
+        st.markdown("## Seguimiento de acciones")
+        st.caption("Aquí puedes revisar qué acciones se han guardado para este periodo.")
 
         period_data = history.get_period(period_key)
         if period_data is None:
-            st.info("Aún no hay plan guardado para este periodo.")
+            st.info("Todavía no hay plan guardado para este periodo.")
         else:
             items = period_data.get("items") or []
             if not items:
-                st.info("Plan guardado, pero sin items.")
+                st.info("El plan existe, pero todavía no hay acciones registradas.")
             else:
                 rows = [
                     {
                         "insight_id": it.get("insight_id", "-"),
-                        "status": it.get("status", "planned"),
-                        "outcome": it.get("outcome", "unknown"),
-                        "updated_at": it.get("updated_at", "-"),
-                        "note": it.get("note", ""),
+                        "estado": it.get("status", "planned"),
+                        "resultado": it.get("outcome", "unknown"),
+                        "actualizado": it.get("updated_at", "-"),
+                        "nota": it.get("note", ""),
                     }
                     for it in items
                 ]
@@ -727,6 +920,18 @@ with tab_admin:
                 st.metric("date_max", str(meta.get("date_max", "-")))
 
             st.divider()
+            st.markdown("**Calidad de lectura / normalización**")
+            placeholders = int(stats.get("placeholders_producto", 0) or 0)
+            cQ1, cQ2, cQ3 = st.columns(3)
+            with cQ1:
+                st.metric("Fuente revenue", str(stats.get("revenue_source", "-")))
+            with cQ2:
+                st.metric("Placeholders producto", f"{placeholders}")
+            with cQ3:
+                st.metric(
+                    "Colisiones mapping",
+                    f"{len(mapping_collisions) if isinstance(mapping_collisions, dict) else 0}",
+                )
 
             sanity = stats.get("sanity") or {}
             if sanity:
@@ -764,20 +969,21 @@ with tab_admin:
                 st.json(mapping_collisions, expanded=False)
 
         st.divider()
-        st.markdown("## Admin · Radar completo")
-        st.caption("Ranking completo + explicación")
+        st.markdown("## Admin · Recomendaciones activadas")
+        st.caption("Vista completa del motor actual")
         try:
-            for s in ranked[:15]:
-                ins = s.insight
-                low, high = ins.estimated_impact_eur
-                st.markdown(f"**💰 {ins.title}**")
+            for card in rescored_cards[:15]:
+                low, high = card.estimated_impact_eur
+                st.markdown(f"**💡 {card.title}**")
                 st.caption(
                     f"Impacto ({horizonte}): {eur(low)} – {eur(high)} · "
-                    f"Esfuerzo: {ins.effort} · Tiempo: {ins.time_to_apply_min} min"
+                    f"Esfuerzo: {card.effort} · Tiempo: {card.time_to_apply_min} min"
                 )
-                st.write(f"**Acción:** {ins.action_hint}")
-                st.caption(f"Evidencia: {ins.evidence}")
-                st.caption(f"Motivo ranking: {s.reason} | score={s.score:.2f}")
+                st.write(f"**Por qué aparece ahora:** {card.why_now}")
+                st.write(f"**Qué podrías probar:** {card.action}")
+                st.write(f"**Si ya lo haces:** {card.if_already_doing}")
+                st.write(f"**Estrategia sugerida:** {card.strategy}")
+                st.caption(f"Peso actual: {card.priority_weight:.2f} | tags={', '.join(card.tags)}")
                 st.divider()
         except Exception:
-            st.info("Radar disponible tras generar candidates/ranking en Owner.")
+            st.info("Las recomendaciones se muestran cuando se genera el Owner.")

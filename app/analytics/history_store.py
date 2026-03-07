@@ -16,6 +16,9 @@ def _now_iso() -> str:
 
 _CLIENT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
+VALID_STATUS = {"planned", "done", "skipped"}
+VALID_OUTCOME = {"unknown", "improved", "not_improved", "already_doing"}
+
 
 def _validate_client_id(client_id: str) -> str:
     cid = str(client_id or "").strip()
@@ -24,6 +27,20 @@ def _validate_client_id(client_id: str) -> str:
             "client_id inválido. Usa solo letras/números/guion/guion_bajo (1-64 chars)."
         )
     return cid
+
+
+def _normalize_status(status: str | None) -> Optional[str]:
+    if status is None:
+        return None
+    value = str(status).strip().lower()
+    return value if value in VALID_STATUS else None
+
+
+def _normalize_outcome(outcome: str | None) -> Optional[str]:
+    if outcome is None:
+        return None
+    value = str(outcome).strip().lower()
+    return value if value in VALID_OUTCOME else None
 
 
 def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -41,13 +58,11 @@ def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
     # 2) backup del actual si existe (best-effort)
     try:
         if path.exists():
-            # os.replace sobreescribe si .bak ya existía (lo cual es OK)
             os.replace(str(path), str(bak_path))
     except Exception:
-        # si falla el backup, no abortamos (pero la escritura atómica sigue)
         pass
 
-    # 3) replace atómico (cross-platform overwrite)
+    # 3) replace atómico
     os.replace(str(tmp_path), str(path))
 
 
@@ -65,7 +80,7 @@ def _safe_load_json(path: Path) -> Optional[Dict[str, Any]]:
 
 @dataclass
 class HistoryStore:
-    """JSON persistence for per-client plans and feedback (schema v1).
+    """Persistencia JSON para planes y feedback por cliente (schema v1).
 
     Schema:
     {
@@ -80,7 +95,7 @@ class HistoryStore:
             {
               "insight_id": "...",
               "status": "planned" | "done" | "skipped",
-              "outcome": "unknown" | "improved" | "not_improved",
+              "outcome": "unknown" | "improved" | "not_improved" | "already_doing",
               "note": "",
               "updated_at": "..."
             }
@@ -94,7 +109,6 @@ class HistoryStore:
     path: Path
 
     def __post_init__(self) -> None:
-        # Evita ids raros (y posibles traversal)
         self.client_id = _validate_client_id(self.client_id)
 
     def ensure_parent(self) -> None:
@@ -112,28 +126,24 @@ class HistoryStore:
 
         data = _safe_load_json(self.path)
         if data is None:
-            # Intentar recuperación desde backup
             bak = self.path.with_suffix(self.path.suffix + ".bak")
             bak_data = _safe_load_json(bak) if bak.exists() else None
             if isinstance(bak_data, dict):
                 data = bak_data
             else:
-                # No reseteamos el archivo original aquí (para no perder evidencia).
                 return self._empty()
 
-        # Normalizar estructura
         data.setdefault("schema_version", 1)
         data.setdefault("client_id", self.client_id)
         data.setdefault("recommendations", [])
 
-        # Asegurar tipo correcto
         if not isinstance(data.get("recommendations"), list):
             data["recommendations"] = []
 
-        # Orden estable por generated_at (si falta, lo manda al final)
         try:
             def _k(r: dict) -> str:
                 return str(r.get("generated_at") or "9999-12-31T23:59:59")
+
             data["recommendations"] = sorted(
                 [r for r in data["recommendations"] if isinstance(r, dict)],
                 key=_k,
@@ -155,8 +165,13 @@ class HistoryStore:
                 return rec
         return None
 
-    def upsert_period_plan(self, period_key: str, insight_ids: list[str], meta: dict | None = None) -> None:
-        """Crea plan si no existe; si existe, actualiza SOLO si no tiene items (no machaca feedback)."""
+    def upsert_period_plan(
+        self,
+        period_key: str,
+        insight_ids: list[str],
+        meta: dict | None = None,
+    ) -> None:
+        """Crea plan si no existe; si existe, actualiza solo si no tiene items."""
         data = self.load()
         recs = data.get("recommendations") or []
 
@@ -169,7 +184,7 @@ class HistoryStore:
         def _new_items() -> list[Dict[str, Any]]:
             return [
                 {
-                    "insight_id": iid,
+                    "insight_id": str(iid),
                     "status": "planned",
                     "outcome": "unknown",
                     "note": "",
@@ -202,8 +217,13 @@ class HistoryStore:
             existing["generated_at"] = existing.get("generated_at") or _now_iso()
             self.save(data)
 
-    def force_replace_period_plan(self, period_key: str, insight_ids: list[str], meta: dict | None = None) -> None:
-        """Admin-only: reemplaza plan (resetea seguimiento)."""
+    def force_replace_period_plan(
+        self,
+        period_key: str,
+        insight_ids: list[str],
+        meta: dict | None = None,
+    ) -> None:
+        """Admin-only: reemplaza plan y resetea seguimiento."""
         data = self.load()
         recs = data.get("recommendations") or []
 
@@ -213,7 +233,7 @@ class HistoryStore:
                 r["meta"] = meta or {}
                 r["items"] = [
                     {
-                        "insight_id": iid,
+                        "insight_id": str(iid),
                         "status": "planned",
                         "outcome": "unknown",
                         "note": "",
@@ -238,11 +258,11 @@ class HistoryStore:
     ) -> bool:
         """Actualiza un item dentro de un periodo.
 
-        Args:
-            create_if_missing: si True y el item no existe pero el periodo sí, lo crea.
-
-        Returns:
-            True si actualiza/crea, False si no existe el periodo (o item y create_if_missing=False).
+        Reglas:
+        - status inválido -> se ignora
+        - outcome inválido -> se ignora
+        - solo se guarda outcome si el status final es 'done'
+        - si status != 'done', outcome pasa a 'unknown'
         """
         data = self.load()
         recs = data.get("recommendations") or []
@@ -266,7 +286,7 @@ class HistoryStore:
                 if not create_if_missing:
                     return False
                 target = {
-                    "insight_id": insight_id,
+                    "insight_id": str(insight_id),
                     "status": "planned",
                     "outcome": "unknown",
                     "note": "",
@@ -274,14 +294,17 @@ class HistoryStore:
                 }
                 items.append(target)
 
-            if status is not None:
-                target["status"] = str(status)
-                if str(status).strip().lower() != "done":
+            normalized_status = _normalize_status(status)
+            normalized_outcome = _normalize_outcome(outcome)
+
+            if normalized_status is not None:
+                target["status"] = normalized_status
+                if normalized_status != "done":
                     target["outcome"] = "unknown"
 
-            if outcome is not None:
+            if normalized_outcome is not None:
                 current_status = str(target.get("status", "planned")).strip().lower()
-                target["outcome"] = str(outcome) if current_status == "done" else "unknown"
+                target["outcome"] = normalized_outcome if current_status == "done" else "unknown"
 
             if note is not None:
                 target["note"] = str(note)
